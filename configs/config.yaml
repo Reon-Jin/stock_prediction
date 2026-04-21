@@ -1,0 +1,138 @@
+project:
+  name: a_share_dataset_builder
+  timezone: Asia/Shanghai
+  data_version: v1
+  feature_version: f1
+  label_version: l1
+  min_list_days: 120
+  default_start: 2023-01-01
+  default_end: 2025-12-31
+  split_method: time_purged
+  split:
+    train_start: 2023-01-01
+    train_end: 2024-12-31
+    valid_start: 2025-03-01
+    valid_end: 2025-06-30
+    test_start: 2025-09-01
+    test_end: 2025-12-31
+    gap_days: 60
+  seq_length: 20
+
+database:
+  url: mysql+pymysql://root:185258@127.0.0.1:3306/a_share_ml?charset=utf8mb4
+  echo: false
+  pool_pre_ping: true
+  pool_recycle: 3600
+
+storage:
+  raw_cache_dir: data/raw_cache
+  parquet_dir: data/parquet
+  export_dir: data/exports
+  bad_records_dir: data/raw_cache/bad_records
+
+providers:
+  default_market_provider: akshare
+  default_fundflow_provider: akshare
+  default_financial_provider: akshare
+  default_news_provider: eastmoney
+  default_disclosure_provider: cninfo
+  daily_bar_source_order: ["sina", "eastmoney", "tx"]
+  security_detail_refresh_all: false
+  security_detail_max_symbols: -1
+  security_detail_max_workers: 4
+  security_detail_fail_fast_threshold: 5
+  tushare_token: ""
+  request_timeout: 20
+  max_retries: 3
+  retry_wait_seconds: 2
+  disable_env_proxy: true
+
+jobs:
+  batch_size: 200
+  max_workers: 1
+  daily_bar_max_workers: 4
+  snapshot_raw_response: true
+  allow_fallback_provider: true
+  continue_on_symbol_error: true
+  capital_flow_fail_fast_threshold: 20
+  capital_flow_public_window_days: 60
+  request_sleep_seconds: 0.2
+  per_symbol_timeout_seconds: 45
+  progress_log_every: 1
+  skip_completed_symbols: true
+
+labels:
+  holding_periods: [3, 5, 10, 20, 40]
+  benchmark_index: 000300.SH
+  bigloss_threshold: -0.05
+
+runtime:
+  torch_device: auto
+  require_gpu: false
+  amp_enabled: true
+
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
+  api_key: sk-7480c85220c848788f68f245252f9f5d
+  temperature: 0.35
+  max_context_messages: 12
+
+events:
+  extraction_mode: hybrid
+  classifier_model_name: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+  type_confidence_threshold: 0.35
+  direction_confidence_threshold: 0.40
+  hybrid_min_confidence: 0.35
+  hf_device: auto
+  max_text_length: 256
+  event_type_labels:
+    earnings_up: 业绩预增、利润改善或基本面超预期
+    buyback: 股份回购、注销或稳定股价安排
+    increase_holding: 股东、高管或产业资本增持
+    major_contract: 重大订单、中标或合同落地
+    new_product: 新产品、新技术、研发突破或新业务进展
+    policy_support: 政策扶持、补贴或行业利好
+    reduction: 股东减持、减持计划或清仓风险
+    regulation: 监管处罚、立案调查或合规风险
+    earnings_down: 业绩预减、亏损扩大或经营恶化
+    lawsuit: 诉讼、仲裁或重大纠纷
+    pledge_risk: 股权质押、平仓或流动性风险
+    black_swan: 黑天鹅、暴雷、爆仓或重大突发风险
+    routine: 常规披露、流程进展或中性提示
+    general_info: 一般资讯，不构成明确事件催化
+  direction_labels:
+    positive: 利好、正向催化或基本面改善
+    negative: 利空、风险暴露或基本面恶化
+    neutral: 中性披露、流程更新或普通资讯
+  positive_keywords:
+    earnings_up: ["预增", "扭亏", "业绩大增", "净利润增长"]
+    buyback: ["回购", "股份回购"]
+    increase_holding: ["增持", "控股股东增持"]
+    major_contract: ["中标", "签订合同", "大单"]
+    new_product: ["新产品", "新技术", "研发突破"]
+    policy_support: ["政策支持", "补贴", "扶持"]
+  negative_keywords:
+    reduction: ["减持", "拟减持"]
+    regulation: ["监管函", "处罚", "立案"]
+    earnings_down: ["预减", "亏损", "业绩下滑"]
+    lawsuit: ["诉讼", "仲裁"]
+    pledge_risk: ["质押", "平仓风险"]
+    black_swan: ["暴雷", "爆仓", "黑天鹅"]
+  neutral_keywords:
+    routine: ["提示性公告", "进展公告", "一般合作"]
+
+company_encoding:
+  enabled: true
+  embedding_dim: 32
+  symbol_emb_dim: 16
+  industry_emb_dim: 8
+  board_emb_dim: 4
+  profile_hidden_dims: [64, 32]
+  similarity_topk: 10
+  similarity_lambda: 0.05
+  profile_lookback_days: 120
+  profile_version: cp1
+  similarity_version: cs1
+  profile_scaling: robust

@@ -1,0 +1,126 @@
+return_scales:
+  3: 0.020
+  5: 0.030
+  10: 0.045
+  20: 0.065
+  40: 0.090
+drawdown_scales:
+  3: 0.040
+  5: 0.060
+  10: 0.090
+  20: 0.120
+  40: 0.160
+upside_scales:
+  3: 0.030
+  5: 0.045
+  10: 0.065
+  20: 0.090
+  40: 0.120
+sigma_scales:
+  3: 0.025
+  5: 0.035
+  10: 0.050
+  20: 0.075
+  40: 0.100
+
+utility_weights:
+  conservative:
+    ret: 0.22
+    p_win: 0.24
+    rank: 0.10
+    upside: 0.08
+    drawdown_penalty: 0.20
+    bigloss_penalty: 0.12
+    uncertainty_penalty: 0.04
+  balanced:
+    ret: 0.26
+    p_win: 0.22
+    rank: 0.12
+    upside: 0.10
+    drawdown_penalty: 0.16
+    bigloss_penalty: 0.10
+    uncertainty_penalty: 0.04
+  aggressive:
+    ret: 0.30
+    p_win: 0.18
+    rank: 0.16
+    upside: 0.14
+    drawdown_penalty: 0.12
+    bigloss_penalty: 0.06
+    uncertainty_penalty: 0.04
+
+time_weights:
+  short:
+    3: 0.36
+    5: 0.32
+    10: 0.18
+    20: 0.10
+    40: 0.04
+  short_mid:
+    3: 0.24
+    5: 0.28
+    10: 0.24
+    20: 0.16
+    40: 0.08
+  mid:
+    3: 0.14
+    5: 0.20
+    10: 0.28
+    20: 0.24
+    40: 0.14
+
+action_thresholds:
+  risk_on:
+    strong_buy: 0.42
+    buy: 0.20
+    watch_low: -0.05
+    avoid: -0.20
+  neutral:
+    strong_buy: 0.48
+    buy: 0.24
+    watch_low: -0.08
+    avoid: -0.24
+  risk_off:
+    strong_buy: 0.58
+    buy: 0.32
+    watch_low: -0.12
+    avoid: -0.28
+
+risk_thresholds:
+  low: 0.25
+  medium: 0.50
+  high: 0.75
+  hard_bigloss: 0.72
+  buy_bigloss: 0.45
+  feature_missing_hard: 0.35
+  feature_missing_warn: 0.15
+  model_drift_hard: 0.75
+  liquidity_hard: 5000000
+  liquidity_warn: 20000000
+  list_days_min: 120
+
+utility_shape:
+  drawdown_alpha: 1.45
+  bigloss_beta: 8.0
+  bigloss_tau: 0.35
+  conflict_lambda: 0.35
+
+risk_score_weights:
+  drawdown: 0.25
+  bigloss: 0.24
+  market: 0.16
+  liquidity: 0.12
+  data_quality: 0.13
+  overheat: 0.10
+
+selection:
+  min_confidence: 0.55
+  min_consistency: 0.50
+  max_bigloss_5_10: 0.45
+  similarity_penalty: 0.10
+  risk_on_industry_fraction: 0.45
+  neutral_industry_fraction: 0.34
+  risk_off_industry_fraction: 0.25
+  risk_on_board_fraction: 0.70
+  neutral_board_fraction: 0.60
+  risk_off_board_fraction: 0.50

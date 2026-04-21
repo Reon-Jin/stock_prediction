@@ -1,0 +1,10 @@
+/frontend/node_modules
+/data
+/logs
+/.idea
+/.claude
+/train/artifacts
+/train/cache
+/tmp
+/tests
+/.pytest_cache
