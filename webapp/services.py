@@ -65,6 +65,8 @@ P_WIN_HORIZONS = (3, 5, 10, 20, 40)
 FRESH_SAMPLE_LOCK = Lock()
 CN_TZ = ZoneInfo("Asia/Shanghai")
 MARKET_SCAN_QUICK_SAMPLE_SIZE = 100
+MARKET_SCAN_QUICK_MIN_WIN_RATE = 0.55
+MARKET_SCAN_QUICK_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -255,11 +257,33 @@ def _sample_active_market_symbols(sample_size: int) -> list[str]:
     return [str(symbol) for symbol in selected.tolist()]
 
 
+def _list_active_market_symbols() -> list[str]:
+    securities = get_repository().get_securities(active_only=True)
+    if securities.empty or "symbol" not in securities.columns:
+        return []
+    return sorted(securities["symbol"].dropna().astype(str).drop_duplicates().tolist())
+
+
 def _filter_prediction_frame_by_symbols(frame: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
     if frame.empty or not symbols or "symbol" not in frame.columns:
         return frame.copy()
     symbol_set = {str(symbol) for symbol in symbols}
     return frame[frame["symbol"].astype(str).isin(symbol_set)].copy()
+
+
+def _best_short_horizon(record: Mapping[str, Any]) -> tuple[int, float, float]:
+    best_horizon = 3
+    best_p_win = -1.0
+    best_ret_mu = 0.0
+    for horizon in (3, 5, 10):
+        p_win = _safe_float(record.get(f"p_win_prob_{horizon}"), -1.0)
+        ret_mu = _safe_float(record.get(f"ret_mu_pred_{horizon}"))
+        candidate = (p_win, ret_mu, -horizon)
+        if candidate > (best_p_win, best_ret_mu, -best_horizon):
+            best_horizon = int(horizon)
+            best_p_win = float(p_win)
+            best_ret_mu = float(ret_mu)
+    return best_horizon, max(0.0, float(best_p_win)), float(best_ret_mu)
 
 
 def _packaged_column_mean(sequence: Any, columns: Any, target_column: str, window: int = 5) -> float:
@@ -1392,10 +1416,210 @@ def _simple_rank_candidates(
         "market_regime_counts": {"neutral": len(enriched)},
         "candidates": candidates,
     }
-def find_user_by_account(session: Session, account: str) -> UserAccount | None:
-    value = account.strip()
-    stmt = select(UserAccount).where(or_(UserAccount.username == value, UserAccount.email == value))
-    return session.execute(stmt).scalar_one_or_none()
+
+
+def _build_market_scan_market_full(
+    *,
+    top_n: int,
+    analysis_date: str,
+    checkpoint_path: Path | None,
+    config: AppConfig,
+    risk_preference: str,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    market_total_candidates = int(get_active_security_count())
+    if progress:
+        progress(
+            {
+                "stage": "candidate_select",
+                "current": 0,
+                "total": market_total_candidates,
+                "message": "正在一次性提取全市场股票样本",
+            }
+        )
+    _ensure_exact_market_trade_date_inputs(
+        analysis_date,
+        target_symbols=None,
+        min_context_rows=1,
+        progress=progress,
+    )
+    raw_df, context_df, effective_trade_date = build_prediction_frame(
+        str(CONFIG_PATH),
+        target_date=analysis_date,
+        target_symbol=None,
+        target_symbols=None,
+    )
+    if effective_trade_date != analysis_date:
+        raise ValueError(f"未能构建 {analysis_date} 的当日全市场样本，系统当前拿到的是 {effective_trade_date}。")
+    if raw_df.empty or context_df.empty:
+        raise ValueError("当前数据库中没有可用于市场扫描的预测样本。")
+    if progress:
+        progress(
+            {
+                "stage": "candidate_select",
+                "current": int(len(raw_df)),
+                "total": market_total_candidates,
+                "message": f"全市场样本提取完成，有效样本 {len(raw_df)}/{market_total_candidates}",
+            }
+        )
+        progress(
+            {
+                "stage": "model_predict",
+                "current": 0,
+                "total": int(len(raw_df)),
+                "message": "正在对全市场样本批量预测",
+            }
+        )
+
+    packaged_df = _build_prediction_export_frame(
+        context_prediction_df=context_df,
+        effective_trade_date=effective_trade_date,
+        seq_length=int(config.project.get("seq_length", 20)),
+    )
+    if packaged_df.empty:
+        raise ValueError("当前交易日未能构建市场推荐样本。")
+    predicted_df, bundle = predict_packaged_dataframe(
+        packaged_df,
+        checkpoint_path,
+        progress=(
+            (
+                lambda current, total: progress(
+                    {
+                        "stage": "model_predict",
+                        "current": int(current),
+                        "total": int(total) if int(total) > 0 else int(len(packaged_df)),
+                        "message": f"正在对全市场样本批量预测，进度 {current}/{total}",
+                    }
+                )
+            )
+            if progress
+            else None
+        ),
+    )
+    merged = _merge_prediction_frames(raw_df, predicted_df, packaged_df)
+    coverage = load_training_coverage(
+        symbols=[str(symbol) for symbol in merged["symbol"].astype(str).tolist()],
+        industries=[str(industry) for industry in merged["industry_sw"].dropna().astype(str).unique().tolist()],
+    )
+    records = [
+        _augment_decision_record(
+            row,
+            model_descriptor=bundle.descriptor,
+            market_symbol_count=market_total_candidates,
+            coverage=coverage,
+        )
+        for row in merged.to_dict(orient="records")
+    ]
+    ranking = _simple_rank_candidates(
+        records,
+        top_n=top_n,
+        risk_preference=risk_preference,
+        metadata=_decision_metadata_from_bundle(
+            bundle,
+            merged["feature_version"].iloc[0] if "feature_version" in merged.columns and not merged.empty else None,
+        ),
+    )
+    return {
+        "effective_trade_date": effective_trade_date,
+        "sample_size": int(len(raw_df)),
+        "market_total_candidates": market_total_candidates,
+        "total_candidates": int(len(merged)),
+        "pool_size": int(ranking["pool_size"]),
+        "selected_count": int(ranking["selected_count"]),
+        "market_regime_counts": ranking["market_regime_counts"],
+        "candidates": ranking["candidates"],
+    }
+def build_market_scan_v2_final(
+    top_n: int,
+    target_date: str | None,
+    risk_preference: str = "balanced",
+    scan_mode: str = "market",
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = get_latest_checkpoint_path()
+    config = get_app_config()
+    analysis_date = _resolve_analysis_target_date(target_date)
+    normalized_scan_mode = _normalize_scan_mode(scan_mode)
+
+    if normalized_scan_mode == "quick":
+        ranking = _build_market_scan_quick_incremental(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            progress=progress,
+        )
+    else:
+        ranking = _build_market_scan_market_full(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            risk_preference=risk_preference,
+            progress=progress,
+        )
+
+    return {
+        "analysis_date": analysis_date,
+        "effective_trade_date": ranking["effective_trade_date"],
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "engine_version": ENGINE_VERSION,
+        "scan_mode": normalized_scan_mode,
+        "sample_size": int(ranking["sample_size"]),
+        "market_total_candidates": int(ranking["market_total_candidates"]),
+        "total_candidates": int(ranking["total_candidates"]),
+        "top_n": int(top_n),
+        "pool_size": int(ranking["pool_size"]),
+        "selected_count": int(ranking["selected_count"]),
+        "market_regime_counts": ranking["market_regime_counts"],
+        "candidates": ranking["candidates"],
+    }
+
+def build_market_scan_v2(
+    top_n: int,
+    target_date: str | None,
+    risk_preference: str = "balanced",
+    scan_mode: str = "market",
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = get_latest_checkpoint_path()
+    config = get_app_config()
+    analysis_date = _resolve_analysis_target_date(target_date)
+    normalized_scan_mode = _normalize_scan_mode(scan_mode)
+
+    if normalized_scan_mode == "quick":
+        ranking = _build_market_scan_quick_incremental(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            progress=progress,
+        )
+    else:
+        ranking = _build_market_scan_market_full(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            risk_preference=risk_preference,
+            progress=progress,
+        )
+
+    return {
+        "analysis_date": analysis_date,
+        "effective_trade_date": ranking["effective_trade_date"],
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "engine_version": ENGINE_VERSION,
+        "scan_mode": normalized_scan_mode,
+        "sample_size": int(ranking["sample_size"]),
+        "market_total_candidates": int(ranking["market_total_candidates"]),
+        "total_candidates": int(ranking["total_candidates"]),
+        "top_n": int(top_n),
+        "pool_size": int(ranking["pool_size"]),
+        "selected_count": int(ranking["selected_count"]),
+        "market_regime_counts": ranking["market_regime_counts"],
+        "candidates": ranking["candidates"],
+    }
 
 
 def build_market_scan_v2(
@@ -1409,15 +1633,394 @@ def build_market_scan_v2(
     config = get_app_config()
     analysis_date = _resolve_analysis_target_date(target_date)
     normalized_scan_mode = _normalize_scan_mode(scan_mode)
-    selected_symbols: list[str] | None = None
-    planned_sample_size = MARKET_SCAN_QUICK_SAMPLE_SIZE if normalized_scan_mode == "quick" else int(get_active_security_count())
-    if normalized_scan_mode == "quick":
-        selected_symbols = _sample_active_market_symbols(max(MARKET_SCAN_QUICK_SAMPLE_SIZE, int(top_n)))
-        if not selected_symbols:
-            raise ValueError("quick market scan has no active symbols to sample")
-        planned_sample_size = int(len(selected_symbols))
 
-    planned_total = planned_sample_size
+    if normalized_scan_mode == "quick":
+        ranking = _build_market_scan_quick_incremental(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            progress=progress,
+        )
+    else:
+        ranking = _build_market_scan_market_full(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            risk_preference=risk_preference,
+            progress=progress,
+        )
+
+    return {
+        "analysis_date": analysis_date,
+        "effective_trade_date": ranking["effective_trade_date"],
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "engine_version": ENGINE_VERSION,
+        "scan_mode": normalized_scan_mode,
+        "sample_size": int(ranking["sample_size"]),
+        "market_total_candidates": int(ranking["market_total_candidates"]),
+        "total_candidates": int(ranking["total_candidates"]),
+        "top_n": int(top_n),
+        "pool_size": int(ranking["pool_size"]),
+        "selected_count": int(ranking["selected_count"]),
+        "market_regime_counts": ranking["market_regime_counts"],
+        "candidates": ranking["candidates"],
+    }
+
+
+def _rank_market_scan_quick_threshold(
+    records: list[Mapping[str, Any]],
+    *,
+    top_n: int,
+) -> dict[str, Any]:
+    if not records:
+        return {
+            "effective_trade_date": None,
+            "top_n": int(top_n),
+            "pool_size": 0,
+            "selected_count": 0,
+            "market_regime_counts": {},
+            "candidates": [],
+        }
+
+    selected_rows: list[dict[str, Any]] = []
+    for record in records:
+        best_horizon, best_p_win, best_ret_mu = _best_short_horizon(record)
+        if best_p_win < MARKET_SCAN_QUICK_MIN_WIN_RATE:
+            continue
+        selected_rows.append(
+            {
+                "record": record,
+                "best_horizon": int(best_horizon),
+                "best_p_win": float(best_p_win),
+                "best_ret_mu": float(best_ret_mu),
+                "signal_score": _safe_float(record.get("signal_score")),
+                "rank_score": _safe_float(record.get("rank_score_pred")),
+            }
+        )
+
+    selected_rows.sort(
+        key=lambda item: (
+            item["best_p_win"],
+            item["best_ret_mu"],
+            item["signal_score"],
+            item["rank_score"],
+        ),
+        reverse=True,
+    )
+    selected = selected_rows[: int(top_n)]
+
+    candidates: list[dict[str, Any]] = []
+    for rank_index, item in enumerate(selected, start=1):
+        record = item["record"]
+        best_horizon = int(item["best_horizon"])
+        best_p_win = float(item["best_p_win"])
+        decision_result = {
+            "symbol": str(record.get("symbol") or ""),
+            "symbol_name": str(record.get("name") or ""),
+            "trade_date": str(record.get("trade_date") or ""),
+            "decision": {
+                "action": "buy",
+                "action_cn": "快速推荐",
+                "confidence": best_p_win,
+                "suggested_hold_days": best_horizon,
+                "best_horizon": str(best_horizon),
+                "path": "market_scan_quick_threshold",
+                "priority": 1,
+            },
+            "scores": {
+                "S_final": _safe_float(record.get("signal_score")),
+                "S_3": _safe_float(record.get("p_win_prob_3")),
+                "S_5": _safe_float(record.get("p_win_prob_5")),
+                "S_10": _safe_float(record.get("p_win_prob_10")),
+                "consistency": 0.0,
+                "R_score": best_p_win,
+            },
+            "market_regime": "neutral",
+            "risk_flags": list(record.get("risk_flags", [])),
+            "risk_review": {
+                "passed": True,
+                "original_action": "buy",
+                "final_action": "buy",
+                "downgraded": False,
+                "risk_flags": list(record.get("risk_flags", [])),
+                "risk_warnings": [],
+                "blocked_rules": [],
+            },
+            "reasons": [
+                f"3/5/10日窗口中，{best_horizon}日上涨概率最高，为 {best_p_win * 100:.1f}%",
+                f"预测收益 {item['best_ret_mu'] * 100:.2f}%，信号分 {_safe_float(record.get('signal_score')):.3f}",
+            ],
+        }
+        candidates.append(
+            {
+                "rank": rank_index,
+                "symbol": str(record.get("symbol") or ""),
+                "name": str(record.get("name") or ""),
+                "industry_sw": str(record.get("industry_sw") or ""),
+                "board": str(record.get("board") or ""),
+                "close": _safe_float(record.get("close")),
+                "pct_chg": _safe_float(record.get("pct_chg")),
+                "avg_amount_5": _safe_float(record.get("avg_amount_5")),
+                "recommended_hold_days": best_horizon,
+                "recommended_hold_label": f"{best_horizon}d",
+                "predicted_win_rate": best_p_win,
+                "signal_score": _safe_float(record.get("signal_score")),
+                "rank_score_pred": _safe_float(record.get("rank_score_pred")),
+                "ret_mu_pred": item["best_ret_mu"],
+                "risk_dd_pred": _safe_float(record.get(f"risk_dd_pred_{best_horizon}")),
+                "bigloss_prob": _safe_float(record.get(f"bigloss_prob_{best_horizon}")),
+                "market_regime_prob": _safe_float(record.get("market_regime_prob"), 0.5),
+                "feature_missing_rate": _safe_float(record.get("feature_missing_rate")),
+                "decision_result": decision_result,
+                "risk_flags": list(record.get("risk_flags", [])),
+                "reasons": decision_result["reasons"],
+                "prediction": {
+                    "signal_score": _safe_float(record.get("signal_score")),
+                    "rank_score_pred": _safe_float(record.get("rank_score_pred")),
+                    "p_win_prob_3": _safe_float(record.get("p_win_prob_3")),
+                    "p_win_prob_5": _safe_float(record.get("p_win_prob_5")),
+                    "p_win_prob_10": _safe_float(record.get("p_win_prob_10")),
+                    "ret_mu_pred_3": _safe_float(record.get("ret_mu_pred_3")),
+                    "ret_mu_pred_5": _safe_float(record.get("ret_mu_pred_5")),
+                    "ret_mu_pred_10": _safe_float(record.get("ret_mu_pred_10")),
+                    "risk_dd_pred_3": _safe_float(record.get("risk_dd_pred_3")),
+                    "risk_dd_pred_5": _safe_float(record.get("risk_dd_pred_5")),
+                    "risk_dd_pred_10": _safe_float(record.get("risk_dd_pred_10")),
+                    "market_regime_prob": _safe_float(record.get("market_regime_prob"), 0.5),
+                },
+                "market_snapshot": {
+                    "close": _safe_float(record.get("close")),
+                    "pct_chg": _safe_float(record.get("pct_chg")),
+                    "turnover_rate": _safe_float(record.get("turnover_rate")),
+                    "vol_ratio_5": _safe_float(record.get("vol_ratio_5")),
+                    "ret_20": _safe_float(record.get("ret_20")),
+                    "ret_5": _safe_float(record.get("ret_5")),
+                    "industry_rank_20d": _safe_float(record.get("industry_rank_20d")),
+                    "market_volatility_5": _safe_float(record.get("market_volatility_5")),
+                    "up_limit_count": _safe_float(record.get("up_limit_count")),
+                    "down_limit_count": _safe_float(record.get("down_limit_count")),
+                    "avg_amount_5": _safe_float(record.get("avg_amount_5")),
+                },
+            }
+        )
+
+    return {
+        "effective_trade_date": str(records[0].get("trade_date") or ""),
+        "top_n": int(top_n),
+        "pool_size": len(selected_rows),
+        "selected_count": len(candidates),
+        "market_regime_counts": {"neutral": len(selected_rows)},
+        "candidates": candidates,
+    }
+
+
+def build_market_scan_v2(
+    top_n: int,
+    target_date: str | None,
+    risk_preference: str = "balanced",
+    scan_mode: str = "market",
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = get_latest_checkpoint_path()
+    config = get_app_config()
+    analysis_date = _resolve_analysis_target_date(target_date)
+    normalized_scan_mode = _normalize_scan_mode(scan_mode)
+
+    if normalized_scan_mode == "quick":
+        ranking = _build_market_scan_quick_incremental(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            progress=progress,
+        )
+    else:
+        ranking = _build_market_scan_market_full(
+            top_n=int(top_n),
+            analysis_date=analysis_date,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            risk_preference=risk_preference,
+            progress=progress,
+        )
+
+    return {
+        "analysis_date": analysis_date,
+        "effective_trade_date": ranking["effective_trade_date"],
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "engine_version": ENGINE_VERSION,
+        "scan_mode": normalized_scan_mode,
+        "sample_size": int(ranking["sample_size"]),
+        "market_total_candidates": int(ranking["market_total_candidates"]),
+        "total_candidates": int(ranking["total_candidates"]),
+        "top_n": int(top_n),
+        "pool_size": int(ranking["pool_size"]),
+        "selected_count": int(ranking["selected_count"]),
+        "market_regime_counts": ranking["market_regime_counts"],
+        "candidates": ranking["candidates"],
+    }
+
+
+def _build_market_scan_quick_incremental(
+    *,
+    top_n: int,
+    analysis_date: str,
+    checkpoint_path: Path | None,
+    config: AppConfig,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    active_symbols = _list_active_market_symbols()
+    if not active_symbols:
+        raise ValueError("quick market scan has no active symbols to scan")
+
+    total_symbols = int(len(active_symbols))
+    extracted_count = 0
+    predicted_count = 0
+    effective_trade_date: str | None = None
+    qualified_records: list[dict[str, Any]] = []
+    scanned_records = 0
+
+    if progress:
+        progress(
+            {
+                "stage": "candidate_select",
+                "current": 0,
+                "total": total_symbols,
+                "message": "正在逐只提取全市场股票样本",
+            }
+        )
+
+    bundle: PredictionBundle | None = None
+    for start in range(0, total_symbols, MARKET_SCAN_QUICK_BATCH_SIZE):
+        batch_symbols = active_symbols[start : start + MARKET_SCAN_QUICK_BATCH_SIZE]
+        _ensure_exact_market_trade_date_inputs(
+            analysis_date,
+            target_symbols=batch_symbols,
+            min_context_rows=1,
+            progress=progress,
+        )
+        raw_df, context_df, batch_trade_date = build_prediction_frame(
+            str(CONFIG_PATH),
+            target_date=analysis_date,
+            target_symbol=None,
+            target_symbols=batch_symbols,
+        )
+        extracted_count += len(batch_symbols)
+        if progress:
+            progress(
+                {
+                    "stage": "candidate_select",
+                    "current": extracted_count,
+                    "total": total_symbols,
+                    "message": f"正在提取股票样本，已提取 {extracted_count}/{total_symbols}",
+                }
+            )
+        if raw_df.empty or context_df.empty or not batch_trade_date:
+            continue
+        effective_trade_date = effective_trade_date or batch_trade_date
+        packaged_df = _build_prediction_export_frame(
+            context_prediction_df=context_df,
+            effective_trade_date=batch_trade_date,
+            seq_length=int(config.project.get("seq_length", 20)),
+        )
+        if packaged_df.empty:
+            continue
+        if progress:
+            progress(
+                {
+                    "stage": "model_predict",
+                    "current": predicted_count,
+                    "total": total_symbols,
+                    "message": f"正在预测股票胜率，已完成 {predicted_count}/{total_symbols}",
+                }
+            )
+        predicted_df, bundle = predict_packaged_dataframe(packaged_df, checkpoint_path)
+        merged = _merge_prediction_frames(raw_df, predicted_df, packaged_df)
+        if merged.empty:
+            continue
+        predicted_count += int(len(merged))
+        scanned_records += int(len(merged))
+        if progress:
+            progress(
+                {
+                    "stage": "model_predict",
+                    "current": predicted_count,
+                    "total": total_symbols,
+                    "message": f"正在预测股票胜率，已完成 {predicted_count}/{total_symbols}",
+                }
+            )
+        coverage = load_training_coverage(
+            symbols=[str(symbol) for symbol in merged["symbol"].astype(str).tolist()],
+            industries=[str(industry) for industry in merged["industry_sw"].dropna().astype(str).unique().tolist()],
+        )
+        batch_records = [
+            _augment_decision_record(
+                row,
+                model_descriptor=bundle.descriptor,
+                market_symbol_count=total_symbols,
+                coverage=coverage,
+            )
+            for row in merged.to_dict(orient="records")
+        ]
+        for record in batch_records:
+            _, best_p_win, _ = _best_short_horizon(record)
+            if best_p_win >= MARKET_SCAN_QUICK_MIN_WIN_RATE:
+                qualified_records.append(record)
+                if len(qualified_records) >= int(top_n):
+                    break
+        if len(qualified_records) >= int(top_n):
+            break
+
+    if not qualified_records:
+        return {
+            "effective_trade_date": effective_trade_date or analysis_date,
+            "sample_size": total_symbols,
+            "market_total_candidates": total_symbols,
+            "total_candidates": scanned_records,
+            "pool_size": 0,
+            "selected_count": 0,
+            "market_regime_counts": {},
+            "candidates": [],
+        }
+
+    ranking = _rank_market_scan_quick_threshold(
+        qualified_records,
+        top_n=min(int(top_n), len(qualified_records)),
+    )
+    return {
+        "effective_trade_date": effective_trade_date or ranking.get("effective_trade_date") or analysis_date,
+        "sample_size": total_symbols,
+        "market_total_candidates": total_symbols,
+        "total_candidates": scanned_records,
+        "pool_size": int(len(qualified_records)),
+        "selected_count": int(ranking["selected_count"]),
+        "market_regime_counts": ranking["market_regime_counts"],
+        "candidates": ranking["candidates"],
+    }
+
+
+def find_user_by_account(session: Session, account: str) -> UserAccount | None:
+    value = account.strip()
+    stmt = select(UserAccount).where(or_(UserAccount.username == value, UserAccount.email == value))
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def build_market_scan_v2(
+    top_n: int,
+    target_date: str | None,
+    risk_preference: str = "balanced",
+    scan_mode: str = "market",
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    return build_market_scan_v2_final(
+        top_n=top_n,
+        target_date=target_date,
+        risk_preference=risk_preference,
+        scan_mode=scan_mode,
+        progress=progress,
+    )
     if progress:
         progress(
             {

@@ -15,6 +15,7 @@ ENGINE_VERSION = "decision_v2.0"
 EPS = 1e-6
 HORIZONS = (3, 5, 10, 20, 40)
 BIGLOSS_HORIZONS = HORIZONS
+QUICK_RECOMMEND_MIN_WIN_RATE = 0.50
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "return_scales": {3: 0.020, 5: 0.030, 10: 0.045, 20: 0.065, 40: 0.090},
@@ -1241,14 +1242,16 @@ def rank_market_candidates_quick(
     top_n: int = 10,
 ) -> dict[str, Any]:
     """
-    快速推荐排序：直接基于 3/5/10 日胜率，为每只股票选择胜率最高的持有时长，
-    然后按最高胜率排序并返回指定数量。
+    快速推荐排序：只在 3/5/10 日窗口内选股，但会先按当前批次对各窗口做校准，
+    避免不同持有周期的原始胜率不在同一基准上时，结果被单一窗口长期垄断。
 
     流程：
     1. 接收所有已完成模型预测的候选记录。
-    2. 为每只股票计算 3/5/10 日胜率，选择最高胜率对应的持有时长。
-    3. 按最高胜率排序。
-    4. 精确返回 top_n 只股票。
+    2. 计算当前批次 3/5/10 日胜率均值，作为各窗口的批次基线。
+    3. 为每只股票选择相对各自窗口基线最强的持有时长。
+    4. 过滤掉胜率低于 50% 的股票，避免把低于抛硬币水平的结果当成推荐。
+    5. 按校准后的最佳分数排序。
+    6. 返回至多 top_n 只股票。
 
     Args:
         records: 预测后的候选记录。
@@ -1269,22 +1272,41 @@ def rank_market_candidates_quick(
     
     top_n = max(1, int(top_n))
     horizons = (3, 5, 10)
+    horizon_baselines: dict[int, float] = {}
+    for horizon in horizons:
+        probabilities = [_normalize_probability(record.get(f"p_win_prob_{horizon}")) for record in records]
+        horizon_baselines[horizon] = sum(probabilities) / len(probabilities) if probabilities else 0.0
     
     enriched: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
     
     for record in records:
         best_horizon = horizons[0]
         best_p_win = -1.0
-        
+        best_ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
+        best_adjusted_score = float("-inf")
+
         for horizon in horizons:
             p_win_key = f"p_win_prob_{horizon}"
             p_win = _normalize_probability(record.get(p_win_key))
-            if p_win > best_p_win:
+            ret_mu = _safe_float(record.get(f"ret_mu_pred_{horizon}"))
+            adjusted_score = p_win - horizon_baselines[horizon]
+            candidate_score = (
+                adjusted_score,
+                p_win,
+                ret_mu,
+                -horizon,
+            )
+            if candidate_score > (best_adjusted_score, best_p_win, best_ret_mu, -best_horizon):
                 best_horizon = horizon
                 best_p_win = p_win
-        
+                best_ret_mu = ret_mu
+                best_adjusted_score = adjusted_score
+
         if best_p_win < 0:
             best_p_win = 0.0
+        if math.isinf(best_adjusted_score):
+            best_adjusted_score = 0.0
         
         symbol = str(record.get("symbol") or "")
         if not symbol:
@@ -1293,8 +1315,6 @@ def rank_market_candidates_quick(
         rank_score = _safe_float(record.get("rank_score_pred"), 0.5)
         avg_amount = _safe_float(record.get("avg_amount_5"), 0.0)
         signal_score = _safe_float(record.get("signal_score"), 0.5)
-        best_ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
-        
         enriched.append({
             "record": record,
             "symbol": symbol,
@@ -1306,14 +1326,19 @@ def rank_market_candidates_quick(
             "avg_amount_5": avg_amount,
             "best_horizon": best_horizon,
             "best_p_win": best_p_win,
-            "sorting_score": best_p_win,
+            "adjusted_score": best_adjusted_score,
+            "sorting_score": (best_adjusted_score, best_p_win),
             "best_ret_mu": best_ret_mu,
             "rank_score": rank_score,
             "signal_score": signal_score,
         })
-    
-    enriched.sort(
+
+        if best_p_win >= QUICK_RECOMMEND_MIN_WIN_RATE:
+            eligible.append(enriched[-1])
+
+    eligible.sort(
         key=lambda x: (
+            x["adjusted_score"],
             x["best_p_win"],
             x["best_ret_mu"],
             x["signal_score"],
@@ -1321,7 +1346,7 @@ def rank_market_candidates_quick(
         ),
         reverse=True,
     )
-    selected = enriched[:top_n]
+    selected = eligible[:top_n]
     
     candidates = []
     for rank_idx, item in enumerate(selected, start=1):
@@ -1377,7 +1402,7 @@ def rank_market_candidates_quick(
     return {
         "effective_trade_date": str(records[0].get("trade_date") or "") if records else None,
         "top_n": top_n,
-        "pool_size": len(enriched),
+        "pool_size": len(eligible),
         "selected_count": len(candidates),
         "sample_size": len(enriched),  # 快速推荐中，样本池就是候选池。
         "total_candidates": len(enriched),
