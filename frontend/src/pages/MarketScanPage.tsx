@@ -62,9 +62,7 @@ export function MarketScanPage() {
               <div className="stage-chip-content">
                 <span>{stageLabelMap[item.stage] || item.label}</span>
                 {typeof item.current === "number" && typeof item.total === "number" && item.total > 0 ? (
-                  <small>
-                    {item.current}/{item.total}
-                  </small>
+                  <small>{`${item.current}/${item.total}${item.message ? ` | ${item.message}` : ""}`}</small>
                 ) : item.message ? (
                   <small>{item.message}</small>
                 ) : null}

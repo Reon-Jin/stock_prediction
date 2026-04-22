@@ -5,6 +5,17 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 
+class SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except PermissionError:
+            # Windows may temporarily lock the active log file when multiple
+            # threads/processes touch the same handler around midnight. Keep
+            # writing to the current file instead of crashing the caller.
+            return
+
+
 def get_logger(name: str, log_dir: str | Path = "logs") -> logging.Logger:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
@@ -20,7 +31,7 @@ def get_logger(name: str, log_dir: str | Path = "logs") -> logging.Logger:
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
 
-    file_handler = TimedRotatingFileHandler(
+    file_handler = SafeTimedRotatingFileHandler(
         filename=Path(log_dir) / f"{name}.log",
         when="midnight",
         backupCount=14,
@@ -32,4 +43,3 @@ def get_logger(name: str, log_dir: str | Path = "logs") -> logging.Logger:
     logger.addHandler(file_handler)
     logger.propagate = False
     return logger
-

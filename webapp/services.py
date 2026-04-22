@@ -894,6 +894,39 @@ def _latest_available_symbol_trade_date_on_or_before(symbol: str, anchor_date: s
         session.close()
 
 
+def _latest_available_market_trade_date_on_or_before(anchor_date: str) -> str | None:
+    session = get_session_factory()()
+    try:
+        target = date.fromisoformat(str(anchor_date))
+        window_start = target - timedelta(days=14)
+        rows = session.execute(
+            select(DailyBar.trade_date, func.count(func.distinct(DailyBar.symbol)).label("symbol_count"))
+            .join(Security, Security.symbol == DailyBar.symbol)
+            .where(
+                Security.status == "active",
+                DailyBar.trade_date <= target,
+                DailyBar.trade_date >= window_start,
+            )
+            .group_by(DailyBar.trade_date)
+            .order_by(DailyBar.trade_date.desc())
+        ).all()
+        if not rows:
+            return None
+        best_count = max(int(symbol_count or 0) for _, symbol_count in rows)
+        coverage_floor = max(1, int(best_count * 0.95))
+        for trade_date, symbol_count in rows:
+            if int(symbol_count or 0) >= coverage_floor:
+                return trade_date.isoformat()
+        return rows[0][0].isoformat()
+    finally:
+        session.close()
+
+
+def _resolve_market_scan_trade_date(target_date: str) -> str:
+    latest_available = _latest_available_market_trade_date_on_or_before(target_date)
+    return latest_available or target_date
+
+
 def _resolve_analysis_target_date(target_date: str | None, now: datetime | None = None) -> str:
     if target_date:
         return date.fromisoformat(str(target_date)).isoformat()
@@ -1427,6 +1460,7 @@ def _build_market_scan_market_full(
     risk_preference: str,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    resolved_analysis_date = _resolve_market_scan_trade_date(analysis_date)
     market_total_candidates = int(get_active_security_count())
     if progress:
         progress(
@@ -1434,23 +1468,27 @@ def _build_market_scan_market_full(
                 "stage": "candidate_select",
                 "current": 0,
                 "total": market_total_candidates,
-                "message": "正在一次性提取全市场股票样本",
+                "message": (
+                    f"使用 {resolved_analysis_date} 的全市场样本"
+                    if resolved_analysis_date != analysis_date
+                    else "正在一次性提取全市场股票样本"
+                ),
             }
         )
     _ensure_exact_market_trade_date_inputs(
-        analysis_date,
+        resolved_analysis_date,
         target_symbols=None,
         min_context_rows=1,
         progress=progress,
     )
     raw_df, context_df, effective_trade_date = build_prediction_frame(
         str(CONFIG_PATH),
-        target_date=analysis_date,
+        target_date=resolved_analysis_date,
         target_symbol=None,
         target_symbols=None,
     )
-    if effective_trade_date != analysis_date:
-        raise ValueError(f"未能构建 {analysis_date} 的当日全市场样本，系统当前拿到的是 {effective_trade_date}。")
+    if effective_trade_date != resolved_analysis_date:
+        raise ValueError(f"无法构建 {resolved_analysis_date} 的全市场样本，当前拿到的是 {effective_trade_date}")
     if raw_df.empty or context_df.empty:
         raise ValueError("当前数据库中没有可用于市场扫描的预测样本。")
     if progress:
@@ -1876,9 +1914,9 @@ def _build_market_scan_quick_incremental(
         raise ValueError("quick market scan has no active symbols to scan")
 
     total_symbols = int(len(active_symbols))
-    extracted_count = 0
-    predicted_count = 0
-    effective_trade_date: str | None = None
+    target_count = max(1, int(top_n))
+    resolved_analysis_date = _resolve_market_scan_trade_date(analysis_date)
+    effective_trade_date: str | None = resolved_analysis_date
     qualified_records: list[dict[str, Any]] = []
     scanned_records = 0
 
@@ -1887,39 +1925,32 @@ def _build_market_scan_quick_incremental(
             {
                 "stage": "candidate_select",
                 "current": 0,
-                "total": total_symbols,
-                "message": "正在逐只提取全市场股票样本",
+                "total": target_count,
+                "message": (
+                    f"使用 {resolved_analysis_date} 扫描全市场股票"
+                    if resolved_analysis_date != analysis_date
+                    else "正在逐只扫描全市场股票"
+                ),
             }
         )
 
-    bundle: PredictionBundle | None = None
-    for start in range(0, total_symbols, MARKET_SCAN_QUICK_BATCH_SIZE):
-        batch_symbols = active_symbols[start : start + MARKET_SCAN_QUICK_BATCH_SIZE]
-        _ensure_exact_market_trade_date_inputs(
-            analysis_date,
-            target_symbols=batch_symbols,
-            min_context_rows=1,
-            progress=progress,
-        )
+    _ensure_exact_market_trade_date_inputs(
+        resolved_analysis_date,
+        target_symbols=None,
+        min_context_rows=1,
+        progress=None,
+    )
+
+    for symbol in active_symbols:
         raw_df, context_df, batch_trade_date = build_prediction_frame(
             str(CONFIG_PATH),
-            target_date=analysis_date,
+            target_date=resolved_analysis_date,
             target_symbol=None,
-            target_symbols=batch_symbols,
+            target_symbols=[symbol],
         )
-        extracted_count += len(batch_symbols)
-        if progress:
-            progress(
-                {
-                    "stage": "candidate_select",
-                    "current": extracted_count,
-                    "total": total_symbols,
-                    "message": f"正在提取股票样本，已提取 {extracted_count}/{total_symbols}",
-                }
-            )
         if raw_df.empty or context_df.empty or not batch_trade_date:
             continue
-        effective_trade_date = effective_trade_date or batch_trade_date
+        effective_trade_date = batch_trade_date
         packaged_df = _build_prediction_export_frame(
             context_prediction_df=context_df,
             effective_trade_date=batch_trade_date,
@@ -1927,32 +1958,13 @@ def _build_market_scan_quick_incremental(
         )
         if packaged_df.empty:
             continue
-        if progress:
-            progress(
-                {
-                    "stage": "model_predict",
-                    "current": predicted_count,
-                    "total": total_symbols,
-                    "message": f"正在预测股票胜率，已完成 {predicted_count}/{total_symbols}",
-                }
-            )
         predicted_df, bundle = predict_packaged_dataframe(packaged_df, checkpoint_path)
         merged = _merge_prediction_frames(raw_df, predicted_df, packaged_df)
         if merged.empty:
             continue
-        predicted_count += int(len(merged))
         scanned_records += int(len(merged))
-        if progress:
-            progress(
-                {
-                    "stage": "model_predict",
-                    "current": predicted_count,
-                    "total": total_symbols,
-                    "message": f"正在预测股票胜率，已完成 {predicted_count}/{total_symbols}",
-                }
-            )
         coverage = load_training_coverage(
-            symbols=[str(symbol) for symbol in merged["symbol"].astype(str).tolist()],
+            symbols=[str(item) for item in merged["symbol"].astype(str).tolist()],
             industries=[str(industry) for industry in merged["industry_sw"].dropna().astype(str).unique().tolist()],
         )
         batch_records = [
@@ -1968,14 +1980,32 @@ def _build_market_scan_quick_incremental(
             _, best_p_win, _ = _best_short_horizon(record)
             if best_p_win >= MARKET_SCAN_QUICK_MIN_WIN_RATE:
                 qualified_records.append(record)
-                if len(qualified_records) >= int(top_n):
+                if progress:
+                    progress(
+                        {
+                            "stage": "candidate_select",
+                            "current": min(len(qualified_records), target_count),
+                            "total": target_count,
+                            "message": f"已命中 {len(qualified_records)}/{target_count}，最新命中 {record.get('symbol')}",
+                        }
+                    )
+                if len(qualified_records) >= target_count:
                     break
-        if len(qualified_records) >= int(top_n):
+            elif progress:
+                progress(
+                    {
+                        "stage": "candidate_select",
+                        "current": min(len(qualified_records), target_count),
+                        "total": target_count,
+                        "message": f"已扫描 {symbol}，当前命中 {len(qualified_records)}/{target_count}",
+                    }
+                )
+        if len(qualified_records) >= target_count:
             break
 
     if not qualified_records:
         return {
-            "effective_trade_date": effective_trade_date or analysis_date,
+            "effective_trade_date": effective_trade_date or resolved_analysis_date,
             "sample_size": total_symbols,
             "market_total_candidates": total_symbols,
             "total_candidates": scanned_records,
@@ -1987,10 +2017,10 @@ def _build_market_scan_quick_incremental(
 
     ranking = _rank_market_scan_quick_threshold(
         qualified_records,
-        top_n=min(int(top_n), len(qualified_records)),
+        top_n=min(target_count, len(qualified_records)),
     )
     return {
-        "effective_trade_date": effective_trade_date or ranking.get("effective_trade_date") or analysis_date,
+        "effective_trade_date": effective_trade_date or ranking.get("effective_trade_date") or resolved_analysis_date,
         "sample_size": total_symbols,
         "market_total_candidates": total_symbols,
         "total_candidates": scanned_records,
