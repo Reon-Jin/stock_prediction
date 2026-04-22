@@ -286,6 +286,14 @@ def _best_short_horizon(record: Mapping[str, Any]) -> tuple[int, float, float]:
     return best_horizon, max(0.0, float(best_p_win)), float(best_ret_mu)
 
 
+def _calibrate_probability_against_threshold(probability: float, threshold: float) -> float:
+    prob = min(max(float(probability), 0.0), 1.0)
+    th = min(max(float(threshold), 1e-6), 0.999999)
+    if prob >= th:
+        return min(1.0, 0.5 + 0.5 * ((prob - th) / max(1.0 - th, 1e-6)))
+    return max(0.0, 0.5 * (prob / th))
+
+
 def _packaged_column_mean(sequence: Any, columns: Any, target_column: str, window: int = 5) -> float:
     if target_column not in columns:
         return 0.0
@@ -922,9 +930,20 @@ def _latest_available_market_trade_date_on_or_before(anchor_date: str) -> str | 
         session.close()
 
 
-def _resolve_market_scan_trade_date(target_date: str) -> str:
-    latest_available = _latest_available_market_trade_date_on_or_before(target_date)
-    return latest_available or target_date
+def _active_daily_bar_count_for_date(target_date: str) -> int:
+    session = get_session_factory()()
+    try:
+        target = date.fromisoformat(str(target_date))
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyBar.symbol)))
+                .join(Security, Security.symbol == DailyBar.symbol)
+                .where(Security.status == "active", DailyBar.trade_date == target)
+            ).scalar()
+            or 0
+        )
+    finally:
+        session.close()
 
 
 def _resolve_analysis_target_date(target_date: str | None, now: datetime | None = None) -> str:
@@ -1460,7 +1479,7 @@ def _build_market_scan_market_full(
     risk_preference: str,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    resolved_analysis_date = _resolve_market_scan_trade_date(analysis_date)
+    coverage_before_refresh = _active_daily_bar_count_for_date(analysis_date)
     market_total_candidates = int(get_active_security_count())
     if progress:
         progress(
@@ -1469,26 +1488,26 @@ def _build_market_scan_market_full(
                 "current": 0,
                 "total": market_total_candidates,
                 "message": (
-                    f"使用 {resolved_analysis_date} 的全市场样本"
-                    if resolved_analysis_date != analysis_date
+                    f"正在补齐 {analysis_date} 的市场数据"
+                    if coverage_before_refresh < max(1, int(market_total_candidates * 0.9))
                     else "正在一次性提取全市场股票样本"
                 ),
             }
         )
     _ensure_exact_market_trade_date_inputs(
-        resolved_analysis_date,
+        analysis_date,
         target_symbols=None,
         min_context_rows=1,
         progress=progress,
     )
     raw_df, context_df, effective_trade_date = build_prediction_frame(
         str(CONFIG_PATH),
-        target_date=resolved_analysis_date,
+        target_date=analysis_date,
         target_symbol=None,
         target_symbols=None,
     )
-    if effective_trade_date != resolved_analysis_date:
-        raise ValueError(f"无法构建 {resolved_analysis_date} 的全市场样本，当前拿到的是 {effective_trade_date}")
+    if effective_trade_date != analysis_date:
+        raise ValueError(f"昨天 {analysis_date} 的市场数据还没有准备完整，当前实际拿到的是 {effective_trade_date}")
     if raw_df.empty or context_df.empty:
         raise ValueError("当前数据库中没有可用于市场扫描的预测样本。")
     if progress:
@@ -1724,7 +1743,12 @@ def _rank_market_scan_quick_threshold(
 
     selected_rows: list[dict[str, Any]] = []
     for record in records:
-        best_horizon, best_p_win, best_ret_mu = _best_short_horizon(record)
+        best_horizon = int(record.get("quick_best_horizon") or 0)
+        best_p_win = _safe_float(record.get("quick_hit_win_rate"), -1.0)
+        best_ret_mu = _safe_float(record.get("quick_best_ret_mu"))
+        if best_horizon <= 0 or best_p_win < 0:
+            best_horizon, raw_best_p_win, best_ret_mu = _best_short_horizon(record)
+            best_p_win = raw_best_p_win
         if best_p_win < MARKET_SCAN_QUICK_MIN_WIN_RATE:
             continue
         selected_rows.append(
@@ -1786,9 +1810,9 @@ def _rank_market_scan_quick_threshold(
                 "risk_warnings": [],
                 "blocked_rules": [],
             },
-            "reasons": [
-                f"3/5/10日窗口中，{best_horizon}日上涨概率最高，为 {best_p_win * 100:.1f}%",
-                f"预测收益 {item['best_ret_mu'] * 100:.2f}%，信号分 {_safe_float(record.get('signal_score')):.3f}",
+                "reasons": [
+                f"3/5/10日窗口中，{best_horizon}日的校准后胜率最高，为 {best_p_win * 100:.1f}%",
+                f"原始上涨概率 {_safe_float(record.get(f'quick_best_raw_p_win', record.get(f'p_win_prob_{best_horizon}'))) * 100:.1f}%，预测收益 {item['best_ret_mu'] * 100:.2f}%",
             ],
         }
         candidates.append(
@@ -1915,10 +1939,18 @@ def _build_market_scan_quick_incremental(
 
     total_symbols = int(len(active_symbols))
     target_count = max(1, int(top_n))
-    resolved_analysis_date = _resolve_market_scan_trade_date(analysis_date)
-    effective_trade_date: str | None = resolved_analysis_date
+    coverage_before_refresh = _active_daily_bar_count_for_date(analysis_date)
+    effective_trade_date: str | None = analysis_date
     qualified_records: list[dict[str, Any]] = []
     scanned_records = 0
+    threshold_map = {horizon: 0.5 for horizon in P_WIN_HORIZONS}
+    checkpoint_bundle: PredictionBundle | None = None
+    if checkpoint_path is not None and checkpoint_path.exists():
+        checkpoint_bundle = load_prediction_bundle(str(checkpoint_path.resolve()))
+        threshold_map = {
+            horizon: float(checkpoint_bundle.thresholds[idx]) if idx < len(checkpoint_bundle.thresholds) else 0.5
+            for idx, horizon in enumerate(P_WIN_HORIZONS)
+        }
 
     if progress:
         progress(
@@ -1927,15 +1959,15 @@ def _build_market_scan_quick_incremental(
                 "current": 0,
                 "total": target_count,
                 "message": (
-                    f"使用 {resolved_analysis_date} 扫描全市场股票"
-                    if resolved_analysis_date != analysis_date
+                    f"正在补齐 {analysis_date} 的市场数据"
+                    if coverage_before_refresh < max(1, int(total_symbols * 0.9))
                     else "正在逐只扫描全市场股票"
                 ),
             }
         )
 
     _ensure_exact_market_trade_date_inputs(
-        resolved_analysis_date,
+        analysis_date,
         target_symbols=None,
         min_context_rows=1,
         progress=None,
@@ -1944,12 +1976,14 @@ def _build_market_scan_quick_incremental(
     for symbol in active_symbols:
         raw_df, context_df, batch_trade_date = build_prediction_frame(
             str(CONFIG_PATH),
-            target_date=resolved_analysis_date,
+            target_date=analysis_date,
             target_symbol=None,
             target_symbols=[symbol],
         )
         if raw_df.empty or context_df.empty or not batch_trade_date:
             continue
+        if batch_trade_date != analysis_date:
+            raise ValueError(f"昨天 {analysis_date} 的市场数据还没有准备完整，当前实际拿到的是 {batch_trade_date}")
         effective_trade_date = batch_trade_date
         packaged_df = _build_prediction_export_frame(
             context_prediction_df=context_df,
@@ -1977,8 +2011,25 @@ def _build_market_scan_quick_incremental(
             for row in merged.to_dict(orient="records")
         ]
         for record in batch_records:
-            _, best_p_win, _ = _best_short_horizon(record)
-            if best_p_win >= MARKET_SCAN_QUICK_MIN_WIN_RATE:
+            best_horizon = 3
+            best_hit_win_rate = -1.0
+            best_raw_p_win = -1.0
+            best_ret_mu = 0.0
+            for horizon in (3, 5, 10):
+                raw_p_win = _safe_float(record.get(f"p_win_prob_{horizon}"), 0.0)
+                hit_win_rate = _calibrate_probability_against_threshold(raw_p_win, threshold_map.get(horizon, 0.5))
+                ret_mu = _safe_float(record.get(f"ret_mu_pred_{horizon}"))
+                candidate = (hit_win_rate, raw_p_win, ret_mu, -horizon)
+                if candidate > (best_hit_win_rate, best_raw_p_win, best_ret_mu, -best_horizon):
+                    best_horizon = int(horizon)
+                    best_hit_win_rate = float(hit_win_rate)
+                    best_raw_p_win = float(raw_p_win)
+                    best_ret_mu = float(ret_mu)
+            record["quick_best_horizon"] = best_horizon
+            record["quick_hit_win_rate"] = best_hit_win_rate
+            record["quick_best_raw_p_win"] = best_raw_p_win
+            record["quick_best_ret_mu"] = best_ret_mu
+            if best_hit_win_rate >= MARKET_SCAN_QUICK_MIN_WIN_RATE:
                 qualified_records.append(record)
                 if progress:
                     progress(
@@ -1986,7 +2037,10 @@ def _build_market_scan_quick_incremental(
                             "stage": "candidate_select",
                             "current": min(len(qualified_records), target_count),
                             "total": target_count,
-                            "message": f"已命中 {len(qualified_records)}/{target_count}，最新命中 {record.get('symbol')}",
+                            "message": (
+                                f"已命中 {len(qualified_records)}/{target_count}，"
+                                f"最新命中 {record.get('symbol')} ({best_hit_win_rate * 100:.1f}%)"
+                            ),
                         }
                     )
                 if len(qualified_records) >= target_count:
@@ -2005,7 +2059,7 @@ def _build_market_scan_quick_incremental(
 
     if not qualified_records:
         return {
-            "effective_trade_date": effective_trade_date or resolved_analysis_date,
+            "effective_trade_date": effective_trade_date or analysis_date,
             "sample_size": total_symbols,
             "market_total_candidates": total_symbols,
             "total_candidates": scanned_records,
@@ -2020,7 +2074,7 @@ def _build_market_scan_quick_incremental(
         top_n=min(target_count, len(qualified_records)),
     )
     return {
-        "effective_trade_date": effective_trade_date or ranking.get("effective_trade_date") or resolved_analysis_date,
+        "effective_trade_date": effective_trade_date or ranking.get("effective_trade_date") or analysis_date,
         "sample_size": total_symbols,
         "market_total_candidates": total_symbols,
         "total_candidates": scanned_records,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -133,9 +134,14 @@ PREDICTION_EXPORT_COLUMNS = [
 
 
 def _resolve_today_target(config_path: str, end: str | None) -> str:
-    ctx = bootstrap("resolve_prediction_target", config_path)
+    ctx = _get_prediction_job_context("resolve_prediction_target", config_path)
     _, resolved_end = resolve_start_end(ctx.config, None, end)
     return resolved_end
+
+
+@lru_cache(maxsize=8)
+def _get_prediction_job_context(job_name: str, config_path: str):
+    return bootstrap(job_name, config_path)
 
 
 def _normalize_symbol(symbol: str | None) -> str | None:
@@ -174,7 +180,7 @@ def build_prediction_frame(
     target_symbol: str | None = None,
     target_symbols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
-    ctx = bootstrap("build_prediction_samples", config_path)
+    ctx = _get_prediction_job_context("build_prediction_samples", config_path)
     _, resolved_end = resolve_start_end(ctx.config, None, target_date)
     target_date = resolved_end
     target_symbol = _normalize_symbol(target_symbol)
