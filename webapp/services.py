@@ -66,6 +66,7 @@ FRESH_SAMPLE_LOCK = Lock()
 CN_TZ = ZoneInfo("Asia/Shanghai")
 MARKET_SCAN_QUICK_SAMPLE_SIZE = 100
 MARKET_SCAN_QUICK_MIN_WIN_RATE = 0.55
+MARKET_SCAN_QUICK_MIN_RET_MU = 0.01
 MARKET_SCAN_QUICK_BATCH_SIZE = 32
 
 
@@ -262,6 +263,22 @@ def _list_active_market_symbols() -> list[str]:
     if securities.empty or "symbol" not in securities.columns:
         return []
     return sorted(securities["symbol"].dropna().astype(str).drop_duplicates().tolist())
+
+
+def _list_active_market_symbols_for_trade_date(target_date: str) -> list[str]:
+    session = get_session_factory()()
+    try:
+        target = date.fromisoformat(str(target_date))
+        rows = session.execute(
+            select(Security.symbol)
+            .join(DailyBar, DailyBar.symbol == Security.symbol)
+            .where(Security.status == "active", DailyBar.trade_date == target)
+            .distinct()
+            .order_by(Security.symbol.asc())
+        ).all()
+        return [str(symbol) for (symbol,) in rows if symbol]
+    finally:
+        session.close()
 
 
 def _filter_prediction_frame_by_symbols(frame: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
@@ -1086,6 +1103,40 @@ def _refresh_market_inputs_for_symbols(
         )
     run_build_event_features(config_path, target_date, target_date, symbols=normalized_symbols)
     run_build_company_profiles(config_path, sync_start, target_date, symbols=normalized_symbols)
+
+
+def _ensure_quick_scan_shared_inputs(target_date: str) -> None:
+    session = get_session_factory()()
+    try:
+        target = date.fromisoformat(str(target_date))
+        index_exists = bool(session.execute(select(IndexBar.id).where(IndexBar.trade_date == target).limit(1)).scalar_one_or_none())
+        sector_exists = bool(
+            session.execute(select(SectorDaily.id).where(SectorDaily.trade_date == target).limit(1)).scalar_one_or_none()
+        )
+    finally:
+        session.close()
+
+    if index_exists and sector_exists:
+        return
+
+    sync_start = (pd.Timestamp(target_date) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+    config_path = str(CONFIG_PATH)
+    run_sync_index_bars(config_path, sync_start, target_date)
+    run_sync_sector_daily(config_path, sync_start, target_date, None)
+
+
+def _refresh_quick_scan_symbol_inputs(target_date: str, symbol: str) -> None:
+    normalized_symbol = normalize_symbol(symbol)
+    if not normalized_symbol:
+        return
+    sync_start = (pd.Timestamp(target_date) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+    config_path = str(CONFIG_PATH)
+    symbols = [normalized_symbol]
+    run_sync_daily_bars(config_path, sync_start, target_date, symbols=symbols)
+    run_sync_financial_snapshot(config_path, sync_start, target_date, None, symbols=symbols)
+    run_sync_news(config_path, target_date, target_date, None, symbols=symbols)
+    run_build_event_features(config_path, target_date, target_date, symbols=symbols)
+    run_build_company_profiles(config_path, sync_start, target_date, symbols=symbols)
 def _ensure_exact_trade_date_inputs(symbol: str, target_date: str) -> None:
     normalized_symbol = normalize_symbol(symbol)
     if _has_exact_trade_date_inputs(normalized_symbol, target_date):
@@ -1749,7 +1800,7 @@ def _rank_market_scan_quick_threshold(
         if best_horizon <= 0 or best_p_win < 0:
             best_horizon, raw_best_p_win, best_ret_mu = _best_short_horizon(record)
             best_p_win = raw_best_p_win
-        if best_p_win < MARKET_SCAN_QUICK_MIN_WIN_RATE:
+        if best_p_win < MARKET_SCAN_QUICK_MIN_WIN_RATE or best_ret_mu <= MARKET_SCAN_QUICK_MIN_RET_MU:
             continue
         selected_rows.append(
             {
@@ -1936,10 +1987,11 @@ def _build_market_scan_quick_incremental(
     active_symbols = _list_active_market_symbols()
     if not active_symbols:
         raise ValueError("quick market scan has no active symbols to scan")
+    rng = np.random.default_rng(seed=int(pd.Timestamp(analysis_date).strftime("%Y%m%d")))
+    active_symbols = [str(symbol) for symbol in rng.permutation(np.asarray(active_symbols, dtype=object)).tolist()]
 
     total_symbols = int(len(active_symbols))
     target_count = max(1, int(top_n))
-    coverage_before_refresh = _active_daily_bar_count_for_date(analysis_date)
     effective_trade_date: str | None = analysis_date
     qualified_records: list[dict[str, Any]] = []
     scanned_records = 0
@@ -1958,32 +2010,31 @@ def _build_market_scan_quick_incremental(
                 "stage": "candidate_select",
                 "current": 0,
                 "total": target_count,
-                "message": (
-                    f"正在补齐 {analysis_date} 的市场数据"
-                    if coverage_before_refresh < max(1, int(total_symbols * 0.9))
-                    else "正在逐只扫描全市场股票"
-                ),
+                "message": f"从 {total_symbols} 支股票中随机扫描 {analysis_date} 数据",
             }
         )
 
-    _ensure_exact_market_trade_date_inputs(
-        analysis_date,
-        target_symbols=None,
-        min_context_rows=1,
-        progress=None,
-    )
-
-    for symbol in active_symbols:
+    for start in range(0, total_symbols, MARKET_SCAN_QUICK_BATCH_SIZE):
+        batch_symbols = active_symbols[start : start + MARKET_SCAN_QUICK_BATCH_SIZE]
         raw_df, context_df, batch_trade_date = build_prediction_frame(
             str(CONFIG_PATH),
             target_date=analysis_date,
             target_symbol=None,
-            target_symbols=[symbol],
+            target_symbols=batch_symbols,
         )
         if raw_df.empty or context_df.empty or not batch_trade_date:
+            if progress and batch_symbols:
+                progress(
+                    {
+                        "stage": "candidate_select",
+                        "current": min(len(qualified_records), target_count),
+                        "total": target_count,
+                        "message": f"已扫描到 {batch_symbols[-1]}，当前命中 {len(qualified_records)}/{target_count}",
+                    }
+                )
             continue
         if batch_trade_date != analysis_date:
-            raise ValueError(f"昨天 {analysis_date} 的市场数据还没有准备完整，当前实际拿到的是 {batch_trade_date}")
+            continue
         effective_trade_date = batch_trade_date
         packaged_df = _build_prediction_export_frame(
             context_prediction_df=context_df,
@@ -2029,7 +2080,7 @@ def _build_market_scan_quick_incremental(
             record["quick_hit_win_rate"] = best_hit_win_rate
             record["quick_best_raw_p_win"] = best_raw_p_win
             record["quick_best_ret_mu"] = best_ret_mu
-            if best_hit_win_rate >= MARKET_SCAN_QUICK_MIN_WIN_RATE:
+            if best_hit_win_rate >= MARKET_SCAN_QUICK_MIN_WIN_RATE and best_ret_mu > MARKET_SCAN_QUICK_MIN_RET_MU:
                 qualified_records.append(record)
                 if progress:
                     progress(
@@ -2039,7 +2090,8 @@ def _build_market_scan_quick_incremental(
                             "total": target_count,
                             "message": (
                                 f"已命中 {len(qualified_records)}/{target_count}，"
-                                f"最新命中 {record.get('symbol')} ({best_hit_win_rate * 100:.1f}%)"
+                                f"最新命中 {record.get('symbol')} "
+                                f"({best_hit_win_rate * 100:.1f}%, 收益 {best_ret_mu * 100:.2f}%)"
                             ),
                         }
                     )
@@ -2051,7 +2103,7 @@ def _build_market_scan_quick_incremental(
                         "stage": "candidate_select",
                         "current": min(len(qualified_records), target_count),
                         "total": target_count,
-                        "message": f"已扫描 {symbol}，当前命中 {len(qualified_records)}/{target_count}",
+                        "message": f"已扫描 {record.get('symbol')}，当前命中 {len(qualified_records)}/{target_count}",
                     }
                 )
         if len(qualified_records) >= target_count:
