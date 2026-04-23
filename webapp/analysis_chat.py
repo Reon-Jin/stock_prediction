@@ -266,6 +266,24 @@ def _prepare_session(
         session.close()
 
 
+def _get_reusable_single_session_id(user_id: int, session_id: int | None, symbol: str | None) -> int | None:
+    if session_id is None:
+        return None
+    session_factory = get_session_factory()
+    session = session_factory()
+    try:
+        session_obj = session.get(AnalysisSession, int(session_id))
+        if session_obj is None or int(session_obj.user_id) != int(user_id):
+            raise ValueError("会话不存在或无权访问。")
+        if session_obj.symbol == MARKET_SCAN_SYMBOL:
+            raise ValueError("会话不存在或无权访问。")
+        if symbol and session_obj.symbol != symbol:
+            return None
+        return int(session_obj.id)
+    finally:
+        session.close()
+
+
 def _append_message(user_id: int, session_id: int, role: str, content: str, payload_json: dict[str, Any] | None = None) -> AnalysisMessage:
     session_factory = get_session_factory()
     session = session_factory()
@@ -512,9 +530,10 @@ def stream_single_stock_chat(
     refresh_analysis: bool,
 ) -> Iterator[str]:
     normalized_symbol = normalize_symbol(symbol) if symbol else None
+    reusable_session_id = _get_reusable_single_session_id(int(user.id), session_id, normalized_symbol)
     session_obj, _ = _prepare_session(
         int(user.id),
-        session_id=session_id,
+        session_id=reusable_session_id,
         symbol=normalized_symbol,
         is_holding=is_holding,
         holding_days=holding_days,

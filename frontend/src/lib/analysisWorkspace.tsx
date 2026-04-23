@@ -32,6 +32,10 @@ const SINGLE_ANALYSIS_STAGES: AnalysisStage[] = [
   { stage: "llm_analysis", label: "AI分析", status: "idle" },
 ];
 
+function normalizeClientSymbol(value: string | null | undefined) {
+  return String(value || "").trim().replace(/\s/g, "").slice(0, 6);
+}
+
 function buildStageState(
   activeStage?: AnalysisStageKey,
   payload?: Partial<AnalysisStage> & { stage?: AnalysisStageKey },
@@ -295,6 +299,9 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
   const sendSingleStream = useCallback(
     async (refreshAnalysis: boolean) => {
       if (!token) return;
+      const requestSymbol = normalizeClientSymbol(singleForm.symbol);
+      const currentSessionSymbol = normalizeClientSymbol(singleCurrentSession?.symbol);
+      const reuseCurrentSession = Boolean(singleCurrentSession?.id) && requestSymbol !== "" && requestSymbol === currentSessionSymbol;
       setSingleSending(true);
       setSingleError("");
       setSingleStreamingAssistant("");
@@ -305,8 +312,8 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
         await api.stream(
           "/analysis/single/stream",
           {
-            session_id: singleCurrentSession?.id ?? null,
-            symbol: singleForm.symbol,
+            session_id: reuseCurrentSession ? (singleCurrentSession?.id ?? null) : null,
+            symbol: requestSymbol,
             is_holding: singleForm.is_holding,
             holding_days: singleForm.holding_days,
             risk_preference: singleForm.risk_preference,

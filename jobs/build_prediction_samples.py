@@ -179,6 +179,8 @@ def build_prediction_frame(
     target_date: str | None = None,
     target_symbol: str | None = None,
     target_symbols: list[str] | None = None,
+    strict_target_date: bool = False,
+    include_st: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
     ctx = _get_prediction_job_context("build_prediction_samples", config_path)
     _, resolved_end = resolve_start_end(ctx.config, None, target_date)
@@ -217,6 +219,14 @@ def build_prediction_frame(
     if effective_trade_ts is None:
         empty = pd.DataFrame(columns=PREDICTION_BASE_COLUMNS)
         return empty, empty, None
+    if strict_target_date and effective_trade_ts != target_ts:
+        ctx.logger.info(
+            "requested prediction date %s unavailable in strict mode, latest available trade_date=%s",
+            target_ts.strftime("%Y-%m-%d"),
+            effective_trade_ts.strftime("%Y-%m-%d"),
+        )
+        empty = pd.DataFrame(columns=PREDICTION_BASE_COLUMNS)
+        return empty, empty, None
     if effective_trade_ts != target_ts:
         ctx.logger.warning(
             "requested prediction date %s has no daily bars; fallback to latest available trade_date=%s",
@@ -236,10 +246,10 @@ def build_prediction_frame(
     )
     features["trade_date"] = pd.to_datetime(features["trade_date"])
     min_list_days = int(ctx.config.project.get("min_list_days", 120))
-    samples = features[
-        (~features["is_st"].fillna(False))
-        & (features["list_days"].fillna(0) >= min_list_days)
-    ].copy()
+    eligibility_mask = features["list_days"].fillna(0) >= min_list_days
+    if not include_st:
+        eligibility_mask = eligibility_mask & (~features["is_st"].fillna(False))
+    samples = features[eligibility_mask].copy()
     if samples.empty:
         empty = pd.DataFrame(columns=PREDICTION_BASE_COLUMNS)
         return empty, empty, effective_trade_ts.strftime("%Y-%m-%d")

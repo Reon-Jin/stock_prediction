@@ -45,6 +45,7 @@ from warehouse.models import (
     CompanyProfile,
     DailyBar,
     EventFeaturesDaily,
+    FinancialSnapshot,
     IndexBar,
     NewsNorm,
     Security,
@@ -843,6 +844,9 @@ def _has_exact_trade_date_inputs(symbol: str, target_date: str) -> bool:
     session = get_session_factory()()
     try:
         target = date.fromisoformat(str(target_date))
+        news_exists = bool(
+            session.execute(select(NewsNorm.news_id).where(NewsNorm.trade_date == target).limit(1)).scalar_one_or_none()
+        )
         daily_exists = bool(
             session.execute(
                 select(DailyBar.id).where(DailyBar.symbol == symbol, DailyBar.trade_date == target).limit(1)
@@ -866,7 +870,15 @@ def _has_exact_trade_date_inputs(symbol: str, target_date: str) -> bool:
                 .limit(1)
             ).scalar_one_or_none()
         )
-        return daily_exists and index_exists and sector_exists and event_exists and profile_exists
+        financial_exists = bool(
+            session.execute(
+                select(FinancialSnapshot.id)
+                .where(FinancialSnapshot.symbol == symbol, FinancialSnapshot.asof_date <= target)
+                .order_by(FinancialSnapshot.asof_date.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        )
+        return daily_exists and index_exists and sector_exists and event_exists and profile_exists and financial_exists and news_exists
     finally:
         session.close()
 
@@ -901,6 +913,17 @@ def _latest_open_trade_date_on_or_before(anchor_date: date) -> date:
     while fallback.weekday() >= 5:
         fallback -= timedelta(days=1)
     return fallback
+
+
+def _resolve_latest_required_trade_date(anchor_date: date) -> date:
+    open_state = _trade_date_open_state(anchor_date.isoformat())
+    if open_state is True:
+        return anchor_date
+    if open_state is False:
+        return _latest_open_trade_date_on_or_before(anchor_date - timedelta(days=1))
+    if anchor_date.weekday() >= 5:
+        return _latest_open_trade_date_on_or_before(anchor_date)
+    return anchor_date
 
 
 def _latest_available_symbol_trade_date_on_or_before(symbol: str, anchor_date: str) -> str | None:
@@ -947,6 +970,28 @@ def _latest_available_market_trade_date_on_or_before(anchor_date: str) -> str | 
         session.close()
 
 
+def _get_security_snapshot(symbol: str) -> dict[str, Any] | None:
+    normalized_symbol = normalize_symbol(symbol)
+    session = get_session_factory()()
+    try:
+        row = session.execute(
+            select(Security.symbol, Security.name, Security.status, Security.is_st, Security.list_date).where(
+                Security.symbol == normalized_symbol
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return {
+            "symbol": str(row.symbol),
+            "name": str(row.name),
+            "status": str(row.status or ""),
+            "is_st": bool(row.is_st),
+            "list_date": row.list_date,
+        }
+    finally:
+        session.close()
+
+
 def _active_daily_bar_count_for_date(target_date: str) -> int:
     session = get_session_factory()()
     try:
@@ -974,7 +1019,7 @@ def _resolve_analysis_target_date(target_date: str | None, now: datetime | None 
         current = current.astimezone(CN_TZ)
 
     previous_date = current.date() - timedelta(days=1)
-    return _latest_open_trade_date_on_or_before(previous_date).isoformat()
+    return _resolve_latest_required_trade_date(previous_date).isoformat()
 
 
 def _is_known_non_trade_date(target_date: str) -> bool:
@@ -1113,16 +1158,26 @@ def _ensure_quick_scan_shared_inputs(target_date: str) -> None:
         sector_exists = bool(
             session.execute(select(SectorDaily.id).where(SectorDaily.trade_date == target).limit(1)).scalar_one_or_none()
         )
+        news_exists = bool(session.execute(select(NewsNorm.news_id).where(NewsNorm.trade_date == target).limit(1)).scalar_one_or_none())
+        event_exists = bool(
+            session.execute(select(EventFeaturesDaily.id).where(EventFeaturesDaily.trade_date == target).limit(1)).scalar_one_or_none()
+        )
     finally:
         session.close()
 
-    if index_exists and sector_exists:
+    if index_exists and sector_exists and news_exists and event_exists:
         return
 
     sync_start = (pd.Timestamp(target_date) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
     config_path = str(CONFIG_PATH)
-    run_sync_index_bars(config_path, sync_start, target_date)
-    run_sync_sector_daily(config_path, sync_start, target_date, None)
+    if not index_exists:
+        run_sync_index_bars(config_path, sync_start, target_date)
+    if not sector_exists:
+        run_sync_sector_daily(config_path, sync_start, target_date, None)
+    if not news_exists:
+        run_sync_news(config_path, target_date, target_date, None, symbols=None)
+    if not event_exists:
+        run_build_event_features(config_path, target_date, target_date, symbols=None)
 
 
 def _refresh_quick_scan_symbol_inputs(target_date: str, symbol: str) -> None:
@@ -1137,6 +1192,75 @@ def _refresh_quick_scan_symbol_inputs(target_date: str, symbol: str) -> None:
     run_sync_news(config_path, target_date, target_date, None, symbols=symbols)
     run_build_event_features(config_path, target_date, target_date, symbols=symbols)
     run_build_company_profiles(config_path, sync_start, target_date, symbols=symbols)
+
+
+def _refresh_quick_scan_batch_symbol_inputs(
+    target_date: str,
+    symbols: list[str],
+    *,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    normalized_symbols = [normalize_symbol(symbol) for symbol in symbols if symbol]
+    if not normalized_symbols:
+        return
+    sync_start = (pd.Timestamp(target_date) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+    config_path = str(CONFIG_PATH)
+    total = len(normalized_symbols)
+
+    def emit_extract_progress(current: int, total_count: int, symbol: str | None) -> None:
+        if not progress:
+            return
+        completed_before_sync = max(total - int(total_count), 0)
+        display_current = min(completed_before_sync + int(current), total)
+        progress(
+            {
+                "stage": "extract_data",
+                "current": int(display_current),
+                "total": int(total),
+                "message": f"正在提取 {symbol} 数据" if symbol else "正在提取快速推荐候选数据",
+            }
+        )
+
+    run_sync_daily_bars(
+        config_path,
+        sync_start,
+        target_date,
+        symbols=normalized_symbols,
+        progress_callback=emit_extract_progress,
+    )
+    session = get_session_factory()()
+    try:
+        target = date.fromisoformat(str(target_date))
+        event_exists = bool(
+            session.execute(select(EventFeaturesDaily.id).where(EventFeaturesDaily.trade_date == target).limit(1)).scalar_one_or_none()
+        )
+    finally:
+        session.close()
+    if not event_exists:
+        run_build_event_features(config_path, target_date, target_date, symbols=normalized_symbols)
+    run_sync_financial_snapshot(config_path, sync_start, target_date, None, symbols=normalized_symbols)
+    run_build_company_profiles(config_path, sync_start, target_date, symbols=normalized_symbols)
+
+
+def _has_quick_scan_batch_daily_rows(target_date: str, symbols: list[str]) -> bool:
+    normalized_symbols = [normalize_symbol(symbol) for symbol in symbols if symbol]
+    if not normalized_symbols:
+        return False
+    session = get_session_factory()()
+    try:
+        target = date.fromisoformat(str(target_date))
+        count = (
+            session.execute(
+                select(func.count(func.distinct(DailyBar.symbol))).where(
+                    DailyBar.trade_date == target,
+                    DailyBar.symbol.in_(normalized_symbols),
+                )
+            ).scalar()
+            or 0
+        )
+        return int(count) > 0
+    finally:
+        session.close()
 def _ensure_exact_trade_date_inputs(symbol: str, target_date: str) -> None:
     normalized_symbol = normalize_symbol(symbol)
     if _has_exact_trade_date_inputs(normalized_symbol, target_date):
@@ -1172,6 +1296,7 @@ def _ensure_exact_market_trade_date_inputs(
         target_date=target_date,
         target_symbol=None,
         target_symbols=target_symbols,
+        strict_target_date=True,
     )
     if len(raw_df) >= min_context_rows and len(context_df) >= min_context_rows and effective_trade_date == target_date:
         return
@@ -1182,6 +1307,7 @@ def _ensure_exact_market_trade_date_inputs(
             target_date=target_date,
             target_symbol=None,
             target_symbols=target_symbols,
+            strict_target_date=True,
         )
         if len(raw_df) >= min_context_rows and len(context_df) >= min_context_rows and effective_trade_date == target_date:
             return
@@ -1195,6 +1321,7 @@ def _ensure_exact_market_trade_date_inputs(
         target_date=target_date,
         target_symbol=None,
         target_symbols=target_symbols,
+        strict_target_date=True,
     )
     if len(raw_df) < min_context_rows or len(context_df) < min_context_rows or effective_trade_date != target_date:
         raise ValueError(f"无法为 {target_date} 构建市场样本")
@@ -1210,15 +1337,27 @@ def build_single_stock_analysis(
     checkpoint_path = get_latest_checkpoint_path()
     config = get_app_config()
     analysis_date = _resolve_analysis_target_date(target_date)
-    if not target_date:
-        latest_available_date = _latest_available_symbol_trade_date_on_or_before(normalized_symbol, analysis_date)
-        if latest_available_date and latest_available_date < analysis_date:
-            analysis_date = latest_available_date
+    min_list_days = int(config.project.get("min_list_days", 120))
+    security_snapshot = _get_security_snapshot(normalized_symbol)
+    if security_snapshot is not None:
+        if security_snapshot["status"] != "active":
+            raise ValueError(f"{normalized_symbol} 当前不是可分析状态")
+        list_date = security_snapshot.get("list_date")
+        if list_date is not None:
+            listed_days = (pd.Timestamp(analysis_date).date() - list_date).days
+            if listed_days < min_list_days:
+                raise ValueError(
+                    f"{normalized_symbol} 上市时间不足 {min_list_days} 天，当前暂不支持个股分析"
+                )
+    if progress:
+        progress("extract_data")
     _ensure_exact_trade_date_inputs(normalized_symbol, analysis_date)
     raw_df, context_df, effective_trade_date = build_prediction_frame(
         str(CONFIG_PATH),
         target_date=analysis_date,
         target_symbol=normalized_symbol,
+        strict_target_date=True,
+        include_st=True,
     )
     if effective_trade_date != analysis_date:
         raise ValueError(
@@ -1556,6 +1695,7 @@ def _build_market_scan_market_full(
         target_date=analysis_date,
         target_symbol=None,
         target_symbols=None,
+        strict_target_date=True,
     )
     if effective_trade_date != analysis_date:
         raise ValueError(f"昨天 {analysis_date} 的市场数据还没有准备完整，当前实际拿到的是 {effective_trade_date}")
@@ -2004,6 +2144,8 @@ def _build_market_scan_quick_incremental(
             for idx, horizon in enumerate(P_WIN_HORIZONS)
         }
 
+    _ensure_quick_scan_shared_inputs(analysis_date)
+
     if progress:
         progress(
             {
@@ -2016,12 +2158,24 @@ def _build_market_scan_quick_incremental(
 
     for start in range(0, total_symbols, MARKET_SCAN_QUICK_BATCH_SIZE):
         batch_symbols = active_symbols[start : start + MARKET_SCAN_QUICK_BATCH_SIZE]
+        if not _has_quick_scan_batch_daily_rows(analysis_date, batch_symbols):
+            _refresh_quick_scan_batch_symbol_inputs(analysis_date, batch_symbols, progress=progress)
         raw_df, context_df, batch_trade_date = build_prediction_frame(
             str(CONFIG_PATH),
             target_date=analysis_date,
             target_symbol=None,
             target_symbols=batch_symbols,
+            strict_target_date=True,
         )
+        if raw_df.empty or context_df.empty or not batch_trade_date:
+            _refresh_quick_scan_batch_symbol_inputs(analysis_date, batch_symbols, progress=progress)
+            raw_df, context_df, batch_trade_date = build_prediction_frame(
+                str(CONFIG_PATH),
+                target_date=analysis_date,
+                target_symbol=None,
+                target_symbols=batch_symbols,
+                strict_target_date=True,
+            )
         if raw_df.empty or context_df.empty or not batch_trade_date:
             if progress and batch_symbols:
                 progress(
@@ -2176,6 +2330,7 @@ def build_market_scan_v2(
         target_date=analysis_date,
         target_symbol=None,
         target_symbols=selected_symbols,
+        strict_target_date=True,
     )
     if effective_trade_date != analysis_date:
         raise ValueError(f"未能构建 {analysis_date} 的当日全市场样本，系统当前拿到的是 {effective_trade_date}。")

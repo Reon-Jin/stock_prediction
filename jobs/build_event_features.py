@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +30,20 @@ def _iter_date_chunks(start: str, end: str, chunk_days: int) -> list[tuple[str, 
     return chunks
 
 
+class _NoopProgressBar:
+    def __enter__(self) -> "_NoopProgressBar":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def set_postfix_str(self, _: str) -> None:
+        return None
+
+    def update(self, _: int = 1) -> None:
+        return None
+
+
 def run(
     config_path: str,
     start: str | None = None,
@@ -52,7 +67,14 @@ def run(
         ctx.repo.delete_event_features(start, end)
         affected = 0
 
-        with tqdm(total=len(chunks), desc="Build event features", unit="chunk") as progress_bar:
+        progress_factory = nullcontext(_NoopProgressBar())
+        if getattr(sys.stderr, "isatty", lambda: False)():
+            try:
+                progress_factory = tqdm(total=len(chunks), desc="Build event features", unit="chunk")
+            except OSError:
+                ctx.logger.warning("tqdm unavailable in current runtime, falling back to no-op progress bar")
+
+        with progress_factory as progress_bar:
             for index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
                 progress_bar.set_postfix_str(f"{chunk_start}->{chunk_end} loading")
                 ctx.logger.info(
