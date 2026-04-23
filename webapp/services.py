@@ -69,6 +69,8 @@ MARKET_SCAN_QUICK_SAMPLE_SIZE = 100
 MARKET_SCAN_QUICK_MIN_WIN_RATE = 0.55
 MARKET_SCAN_QUICK_MIN_RET_MU = 0.01
 MARKET_SCAN_QUICK_BATCH_SIZE = 32
+MARKET_SCAN_FULL_DAILY_COVERAGE_RATIO = 0.9
+MARKET_SCAN_FULL_MIN_SAMPLE_RATIO = 0.05
 
 
 @dataclass(frozen=True)
@@ -1008,6 +1010,47 @@ def _active_daily_bar_count_for_date(target_date: str) -> int:
         session.close()
 
 
+def _full_market_daily_coverage_floor(market_total_candidates: int) -> int:
+    return max(1, int(int(market_total_candidates or 0) * MARKET_SCAN_FULL_DAILY_COVERAGE_RATIO))
+
+
+def _ensure_full_market_daily_inputs(
+    target_date: str,
+    *,
+    market_total_candidates: int,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> int:
+    if _is_known_non_trade_date(target_date):
+        raise ValueError(f"{target_date} 不是交易日，无法构建市场样本")
+
+    coverage_floor = _full_market_daily_coverage_floor(market_total_candidates)
+    coverage = _active_daily_bar_count_for_date(target_date)
+    if coverage >= coverage_floor:
+        return coverage
+
+    if progress:
+        progress(
+            {
+                "stage": "candidate_select",
+                "current": int(coverage),
+                "total": int(market_total_candidates),
+                "message": f"正在补齐 {target_date} 的全市场行情数据，已有 {coverage}/{market_total_candidates}",
+            }
+        )
+    with FRESH_SAMPLE_LOCK:
+        coverage = _active_daily_bar_count_for_date(target_date)
+        if coverage < coverage_floor:
+            _refresh_market_inputs_for_date(target_date, progress=progress)
+
+    coverage = _active_daily_bar_count_for_date(target_date)
+    if coverage < coverage_floor:
+        raise ValueError(
+            f"{target_date} 全市场行情数据覆盖不足，当前仅 {coverage}/{market_total_candidates}，"
+            "请检查数据源或稍后重试"
+        )
+    return coverage
+
+
 def _resolve_analysis_target_date(target_date: str | None, now: datetime | None = None) -> str:
     if target_date:
         return date.fromisoformat(str(target_date)).isoformat()
@@ -1671,23 +1714,23 @@ def _build_market_scan_market_full(
 ) -> dict[str, Any]:
     coverage_before_refresh = _active_daily_bar_count_for_date(analysis_date)
     market_total_candidates = int(get_active_security_count())
+    coverage_floor = _full_market_daily_coverage_floor(market_total_candidates)
     if progress:
         progress(
             {
                 "stage": "candidate_select",
-                "current": 0,
+                "current": int(coverage_before_refresh),
                 "total": market_total_candidates,
                 "message": (
-                    f"正在补齐 {analysis_date} 的市场数据"
-                    if coverage_before_refresh < max(1, int(market_total_candidates * 0.9))
+                    f"正在补齐 {analysis_date} 的全市场数据，已有 {coverage_before_refresh}/{market_total_candidates}"
+                    if coverage_before_refresh < coverage_floor
                     else "正在一次性提取全市场股票样本"
                 ),
             }
         )
-    _ensure_exact_market_trade_date_inputs(
+    daily_coverage = _ensure_full_market_daily_inputs(
         analysis_date,
-        target_symbols=None,
-        min_context_rows=1,
+        market_total_candidates=market_total_candidates,
         progress=progress,
     )
     raw_df, context_df, effective_trade_date = build_prediction_frame(
@@ -1701,6 +1744,38 @@ def _build_market_scan_market_full(
         raise ValueError(f"昨天 {analysis_date} 的市场数据还没有准备完整，当前实际拿到的是 {effective_trade_date}")
     if raw_df.empty or context_df.empty:
         raise ValueError("当前数据库中没有可用于市场扫描的预测样本。")
+    min_expected_samples = max(1, int(market_total_candidates * MARKET_SCAN_FULL_MIN_SAMPLE_RATIO))
+    if len(raw_df) < min_expected_samples:
+        if progress:
+            progress(
+                {
+                    "stage": "candidate_select",
+                    "current": int(len(raw_df)),
+                    "total": int(market_total_candidates),
+                    "message": (
+                        f"有效样本仅 {len(raw_df)}/{market_total_candidates}，正在补齐静态、市场、公司和新闻事件数据"
+                    ),
+                }
+            )
+        with FRESH_SAMPLE_LOCK:
+            _refresh_market_inputs_for_date(analysis_date, progress=progress)
+        daily_coverage = _active_daily_bar_count_for_date(analysis_date)
+        raw_df, context_df, effective_trade_date = build_prediction_frame(
+            str(CONFIG_PATH),
+            target_date=analysis_date,
+            target_symbol=None,
+            target_symbols=None,
+            strict_target_date=True,
+        )
+        if effective_trade_date != analysis_date:
+            raise ValueError(f"昨天 {analysis_date} 的市场数据还没有准备完整，当前实际拿到的是 {effective_trade_date}")
+        if raw_df.empty or context_df.empty:
+            raise ValueError("当前数据库中没有可用于市场扫描的预测样本。")
+        if len(raw_df) < min_expected_samples:
+            raise ValueError(
+                f"{analysis_date} 全市场样本构建数量异常偏少，仅 {len(raw_df)}/{market_total_candidates}，"
+                f"当日日线覆盖 {daily_coverage}/{market_total_candidates}，请检查样本构建所需的静态、市场、公司、新闻数据"
+            )
     if progress:
         progress(
             {
@@ -1726,6 +1801,15 @@ def _build_market_scan_market_full(
     )
     if packaged_df.empty:
         raise ValueError("当前交易日未能构建市场推荐样本。")
+    if progress:
+        progress(
+            {
+                "stage": "model_predict",
+                "current": 0,
+                "total": int(len(packaged_df)),
+                "message": f"模型输入已构建，正在加载模型并预测 {len(packaged_df)} 支股票",
+            }
+        )
     predicted_df, bundle = predict_packaged_dataframe(
         packaged_df,
         checkpoint_path,
