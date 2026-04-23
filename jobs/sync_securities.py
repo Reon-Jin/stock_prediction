@@ -88,11 +88,12 @@ def _prepare_single_symbol_security(ctx, target_symbol: str, existing: pd.DataFr
     else:
         ctx.logger.info("reusing existing security snapshot for %s", normalized_symbol)
 
-    try:
-        detail = ctx.market_provider.fetch_security_profile_cninfo(normalized_symbol)
-    except Exception as exc:
-        ctx.logger.warning("single-symbol profile enrichment unavailable for %s: %s", normalized_symbol, exc)
-        detail = {}
+    detail = {}
+    if bool(ctx.config.providers.get("security_detail_enabled", False)):
+        try:
+            detail = ctx.market_provider.fetch_security_profile_cninfo(normalized_symbol)
+        except Exception as exc:
+            ctx.logger.warning("single-symbol profile enrichment unavailable for %s: %s", normalized_symbol, exc)
 
     if detail:
         for column in ["name", "industry", "list_date"]:
@@ -171,61 +172,71 @@ def run(
 
             securities = _enrich_with_bulk_spot(ctx, securities)
 
-            refresh_all_profiles = bool(ctx.config.providers.get("security_detail_refresh_all", False))
-            missing_profile_mask = (
-                refresh_all_profiles
-                | securities["industry"].isna()
-                | securities["list_date"].isna()
-                | securities["name"].isna()
-            )
-            detail_symbols = securities.loc[missing_profile_mask, "symbol"].dropna().astype(str).tolist()
-            max_detail_symbols = int(ctx.config.providers.get("security_detail_max_symbols", 50))
-            detail_fail_fast_threshold = int(ctx.config.providers.get("security_detail_fail_fast_threshold", 5))
-            detail_max_workers = int(ctx.config.providers.get("security_detail_max_workers", 4))
-            if max_detail_symbols >= 0 and len(detail_symbols) > max_detail_symbols:
-                ctx.logger.warning(
-                    "detail enrichment symbols=%s exceeds cap=%s; only enriching the first capped subset after bulk spot fill",
-                    len(detail_symbols),
-                    max_detail_symbols,
+            detail_enabled = bool(ctx.config.providers.get("security_detail_enabled", False))
+            if detail_enabled:
+                refresh_all_profiles = bool(ctx.config.providers.get("security_detail_refresh_all", False))
+                missing_profile_mask = (
+                    refresh_all_profiles
+                    | securities["industry"].isna()
+                    | securities["list_date"].isna()
+                    | securities["name"].isna()
                 )
-                detail_symbols = detail_symbols[:max_detail_symbols]
-            if detail_symbols:
-                details: list[dict[str, object]] = []
-                consecutive_detail_failures = 0
-                with ThreadPoolExecutor(max_workers=max(1, detail_max_workers)) as executor:
-                    future_map = {
-                        executor.submit(ctx.market_provider.fetch_security_profile_cninfo, symbol): symbol for symbol in detail_symbols
-                    }
-                    progress = tqdm(total=len(future_map), desc="Enrich security profiles", unit="stock")
-                    try:
-                        for future in as_completed(future_map):
-                            symbol = future_map[future]
-                            try:
-                                details.append(future.result())
-                                consecutive_detail_failures = 0
-                            except Exception as exc:
-                                consecutive_detail_failures += 1
-                                ctx.logger.warning("failed enriching security profile for %s: %s", symbol, exc)
-                                if detail_fail_fast_threshold > 0 and consecutive_detail_failures >= detail_fail_fast_threshold:
-                                    ctx.logger.warning(
-                                        "security detail source appears unavailable; stop detail enrichment early after %s consecutive failures",
-                                        consecutive_detail_failures,
-                                    )
-                                    for pending_future in future_map:
-                                        pending_future.cancel()
-                                    break
-                            finally:
-                                progress.update(1)
-                    finally:
-                        progress.close()
-                if details:
-                    detail_df = pd.DataFrame(details).drop_duplicates("symbol")
-                    securities = securities.merge(detail_df, on="symbol", how="left", suffixes=("", "_detail"))
-                    for column in ["name", "industry", "list_date"]:
-                        detail_column = f"{column}_detail"
-                        if detail_column in securities.columns:
-                            securities[column] = securities[detail_column].combine_first(securities[column])
-                    securities = securities[[column for column in securities.columns if not column.endswith("_detail")]]
+                detail_symbols = securities.loc[missing_profile_mask, "symbol"].dropna().astype(str).tolist()
+                max_detail_symbols = int(ctx.config.providers.get("security_detail_max_symbols", 50))
+                detail_fail_fast_threshold = int(ctx.config.providers.get("security_detail_fail_fast_threshold", 5))
+                detail_max_workers = int(ctx.config.providers.get("security_detail_max_workers", 1))
+                if detail_max_workers > 1:
+                    ctx.logger.warning(
+                        "security detail enrichment uses cninfo/mini_racer; forcing max_workers=1 to avoid native crashes"
+                    )
+                    detail_max_workers = 1
+                if max_detail_symbols >= 0 and len(detail_symbols) > max_detail_symbols:
+                    ctx.logger.warning(
+                        "detail enrichment symbols=%s exceeds cap=%s; only enriching the first capped subset after bulk spot fill",
+                        len(detail_symbols),
+                        max_detail_symbols,
+                    )
+                    detail_symbols = detail_symbols[:max_detail_symbols]
+                if detail_symbols:
+                    details: list[dict[str, object]] = []
+                    consecutive_detail_failures = 0
+                    with ThreadPoolExecutor(max_workers=max(1, detail_max_workers)) as executor:
+                        future_map = {
+                            executor.submit(ctx.market_provider.fetch_security_profile_cninfo, symbol): symbol
+                            for symbol in detail_symbols
+                        }
+                        progress = tqdm(total=len(future_map), desc="Enrich security profiles", unit="stock")
+                        try:
+                            for future in as_completed(future_map):
+                                symbol = future_map[future]
+                                try:
+                                    details.append(future.result())
+                                    consecutive_detail_failures = 0
+                                except Exception as exc:
+                                    consecutive_detail_failures += 1
+                                    ctx.logger.warning("failed enriching security profile for %s: %s", symbol, exc)
+                                    if detail_fail_fast_threshold > 0 and consecutive_detail_failures >= detail_fail_fast_threshold:
+                                        ctx.logger.warning(
+                                            "security detail source appears unavailable; stop detail enrichment early after %s consecutive failures",
+                                            consecutive_detail_failures,
+                                        )
+                                        for pending_future in future_map:
+                                            pending_future.cancel()
+                                        break
+                                finally:
+                                    progress.update(1)
+                        finally:
+                            progress.close()
+                    if details:
+                        detail_df = pd.DataFrame(details).drop_duplicates("symbol")
+                        securities = securities.merge(detail_df, on="symbol", how="left", suffixes=("", "_detail"))
+                        for column in ["name", "industry", "list_date"]:
+                            detail_column = f"{column}_detail"
+                            if detail_column in securities.columns:
+                                securities[column] = securities[detail_column].combine_first(securities[column])
+                        securities = securities[[column for column in securities.columns if not column.endswith("_detail")]]
+            else:
+                ctx.logger.info("security detail enrichment disabled; using bulk/basic security snapshot only")
 
             securities["industry"] = securities["industry"].fillna("Unknown")
             securities["board"] = securities["board"].fillna("Unknown")

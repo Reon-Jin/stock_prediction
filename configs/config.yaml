@@ -37,9 +37,10 @@ providers:
   default_news_provider: eastmoney
   default_disclosure_provider: cninfo
   daily_bar_source_order: ["sina", "eastmoney", "tx"]
+  security_detail_enabled: false
   security_detail_refresh_all: false
   security_detail_max_symbols: -1
-  security_detail_max_workers: 4
+  security_detail_max_workers: 1
   security_detail_fail_fast_threshold: 5
   tushare_token: ""
   request_timeout: 20
