@@ -26,20 +26,34 @@ def run(
     limit: int | None = None,
     symbols: list[str] | None = None,
     progress_callback: Callable[[int, int, str | None], None] | None = None,
+    source_order: list[str] | None = None,
+    request_sleep_seconds: float | None = None,
+    max_workers_override: int | None = None,
 ) -> None:
     ctx = bootstrap("sync_daily_bars", config_path)
+    if source_order:
+        ctx.config.providers["daily_bar_source_order"] = list(source_order)
     start, end = resolve_start_end(ctx.config, start, end)
     job_id = ctx.repo.record_job_start(
         "sync_daily_bars",
-        {"start": start, "end": end, "limit": limit, "symbols": symbols},
+        {"start": start, "end": end, "limit": limit, "symbols": symbols, "source_order": source_order},
     )
     affected = 0
     failed_symbols: list[str] = []
     continue_on_symbol_error = bool(ctx.config.jobs.get("continue_on_symbol_error", True))
-    request_sleep_seconds = float(ctx.config.jobs.get("request_sleep_seconds", 0.2))
+    if request_sleep_seconds is None:
+        request_sleep_seconds = float(ctx.config.jobs.get("request_sleep_seconds", 0.2))
     progress_log_every = int(ctx.config.jobs.get("progress_log_every", 1))
     skip_completed_symbols = bool(ctx.config.jobs.get("skip_completed_symbols", True))
-    max_workers = max(1, int(ctx.config.jobs.get("daily_bar_max_workers", ctx.config.jobs.get("max_workers", 1)) or 1))
+    max_workers = max(
+        1,
+        int(
+            max_workers_override
+            if max_workers_override is not None
+            else ctx.config.jobs.get("daily_bar_max_workers", ctx.config.jobs.get("max_workers", 1))
+            or 1
+        ),
+    )
 
     def fetch_symbol(symbol: str) -> tuple[str, list[dict], list[dict]]:
         rows = ctx.market_provider.fetch_daily_bars(symbol, start, end)
@@ -82,6 +96,8 @@ def run(
         if max_workers <= 1 or total <= 1:
             for idx, symbol in enumerate(selected_symbols, start=1):
                 try:
+                    if progress_callback:
+                        progress_callback(idx - 1, total, symbol)
                     if progress_log_every > 0 and (idx == 1 or idx % progress_log_every == 0):
                         ctx.logger.info("progress %s/%s fetching %s", idx, total, symbol)
                     _, valid_rows, bad_rows = fetch_symbol(symbol)

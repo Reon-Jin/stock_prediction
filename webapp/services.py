@@ -1100,16 +1100,22 @@ def _refresh_market_inputs_for_date(
 ) -> None:
     sync_start = (pd.Timestamp(target_date) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
     config_path = str(CONFIG_PATH)
+    config = get_app_config()
+    full_market_source_order = list(config.providers.get("full_market_daily_bar_source_order", ["tx"]))
+    full_market_sleep_seconds = float(config.providers.get("full_market_request_sleep_seconds", 0))
+    full_market_max_workers = int(config.providers.get("full_market_daily_bar_max_workers", 4))
     total = int(get_active_security_count())
+    base_daily_coverage = _active_daily_bar_count_for_date(target_date)
 
     def emit_extract_progress(current: int, total_count: int, symbol: str | None) -> None:
         if not progress:
             return
-        display_total = int(total_count or total or 0)
+        display_total = int(total or total_count or 0)
+        display_current = min(int(base_daily_coverage) + int(current), display_total) if display_total else int(current)
         progress(
             {
                 "stage": "extract_data",
-                "current": int(current),
+                "current": int(display_current),
                 "total": display_total,
                 "message": f"正在提取 {symbol} 数据" if symbol else "正在提取市场数据",
             }
@@ -1122,6 +1128,9 @@ def _refresh_market_inputs_for_date(
         target_date,
         symbols=None,
         progress_callback=emit_extract_progress,
+        source_order=full_market_source_order,
+        request_sleep_seconds=full_market_sleep_seconds,
+        max_workers_override=full_market_max_workers,
     )
     if progress:
         progress(

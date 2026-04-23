@@ -37,6 +37,9 @@ providers:
   default_news_provider: eastmoney
   default_disclosure_provider: cninfo
   daily_bar_source_order: ["sina", "eastmoney", "tx"]
+  full_market_daily_bar_source_order: ["tx"]
+  full_market_request_sleep_seconds: 0
+  full_market_daily_bar_max_workers: 24
   security_detail_enabled: false
   security_detail_refresh_all: false
   security_detail_max_symbols: -1

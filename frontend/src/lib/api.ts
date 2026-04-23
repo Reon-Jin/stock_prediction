@@ -1,9 +1,14 @@
 const API_PREFIX = "/api";
 const DEFAULT_TIMEOUT_MS = 15000;
 
-async function request<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  token?: string | null,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<T> {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   let response: Response;
   try {
     response = await fetch(`${API_PREFIX}${path}`, {
@@ -98,9 +103,11 @@ async function stream(path: string, body: unknown, token: string, handlers: Stre
 }
 
 export const api = {
-  get: <T>(path: string, token?: string | null) => request<T>(path, { method: "GET" }, token),
-  post: <T>(path: string, body: unknown, token?: string | null) =>
-    request<T>(path, { method: "POST", body: JSON.stringify(body) }, token),
-  delete: <T>(path: string, token?: string | null) => request<T>(path, { method: "DELETE" }, token),
+  get: <T>(path: string, token?: string | null, timeoutMs?: number) =>
+    request<T>(path, { method: "GET" }, token, timeoutMs),
+  post: <T>(path: string, body: unknown, token?: string | null, timeoutMs?: number) =>
+    request<T>(path, { method: "POST", body: JSON.stringify(body) }, token, timeoutMs),
+  delete: <T>(path: string, token?: string | null, timeoutMs?: number) =>
+    request<T>(path, { method: "DELETE" }, token, timeoutMs),
   stream,
 };

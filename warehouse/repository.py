@@ -259,7 +259,9 @@ class WarehouseRepository:
         if isinstance(value, date):
             return value.isoformat()
         if isinstance(value, np.generic):
-            return value.item()
+            return cls._normalize_json_payload(value.item())
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
         if isinstance(value, Path):
             return str(value)
         return value
@@ -299,7 +301,7 @@ class WarehouseRepository:
             {
                 "domain": domain,
                 "business_key": str(record.get("symbol") or record.get("news_id") or record.get("announcement_id") or ""),
-                "payload": record,
+                "payload": self._normalize_json_payload(record),
                 "error_message": error_message,
             }
             for record in records

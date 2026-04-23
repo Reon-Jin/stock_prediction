@@ -151,7 +151,6 @@ class MarketProvider(BaseProvider):
         return self.wrap_fetch("securities", {}, _fetch)
 
     def fetch_daily_bars(self, symbol: str, start: str, end: str) -> list[dict[str, Any]]:
-        ak = self.require_akshare()
         code = symbol_to_akshare(symbol)
         normalized_symbol = normalize_symbol(symbol)
         market_symbol = self._to_market_prefixed_symbol(normalized_symbol)
@@ -161,7 +160,10 @@ class MarketProvider(BaseProvider):
             errors: list[str] = []
             for source_name in source_order:
                 try:
-                    if source_name == "eastmoney":
+                    if source_name == "eastmoney_http":
+                        normalized = self._fetch_eastmoney_http_daily(normalized_symbol, start, end)
+                    elif source_name == "eastmoney":
+                        ak = self.require_akshare()
                         df = ak.stock_zh_a_hist(
                             symbol=code,
                             period="daily",
@@ -171,6 +173,7 @@ class MarketProvider(BaseProvider):
                         )
                         normalized = self._normalize_eastmoney_hist(df, normalized_symbol)
                     elif source_name == "sina":
+                        ak = self.require_akshare()
                         df = ak.stock_zh_a_daily(
                             symbol=market_symbol,
                             start_date=start.replace("-", ""),
@@ -179,6 +182,7 @@ class MarketProvider(BaseProvider):
                         )
                         normalized = self._normalize_sina_daily(df, normalized_symbol)
                     elif source_name == "tx":
+                        ak = self.require_akshare()
                         df = ak.stock_zh_a_hist_tx(
                             symbol=market_symbol,
                             start_date=start.replace("-", ""),
@@ -317,6 +321,49 @@ class MarketProvider(BaseProvider):
         market = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(exchange, "sz")
         return f"{market}{code}"
 
+    @staticmethod
+    def _to_eastmoney_secid(symbol: str) -> str:
+        normalized = normalize_symbol(symbol)
+        code, exchange = normalized.split(".")
+        market = "1" if exchange == "SH" else "0"
+        return f"{market}.{code}"
+
+    def _fetch_eastmoney_http_daily(self, symbol: str, start: str, end: str) -> list[dict[str, Any]]:
+        payload = self.http_get_json(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={
+                "secid": self._to_eastmoney_secid(symbol),
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "101",
+                "fqt": "1",
+                "beg": start.replace("-", ""),
+                "end": end.replace("-", ""),
+            },
+            timeout=float(self.provider_conf.get("request_timeout", 20)),
+        )
+        klines = ((payload or {}).get("data") or {}).get("klines") or []
+        rows: list[dict[str, Any]] = []
+        for item in klines:
+            parts = str(item).split(",")
+            if len(parts) < 11:
+                continue
+            rows.append(
+                {
+                    "trade_date": parts[0],
+                    "open": parts[1],
+                    "close": parts[2],
+                    "high": parts[3],
+                    "low": parts[4],
+                    "volume": float(parts[5]) * 100,
+                    "amount": parts[6],
+                    "amplitude": parts[7],
+                    "pct_chg": parts[8],
+                    "turnover_rate": parts[10],
+                }
+            )
+        return self._finalize_daily_bar_df(pd.DataFrame(rows), symbol, "eastmoney_http")
+
     def _finalize_daily_bar_df(self, df: pd.DataFrame, symbol: str, source: str) -> list[dict[str, Any]]:
         if df is None or df.empty:
             return []
@@ -390,8 +437,9 @@ class MarketProvider(BaseProvider):
         if df is None or df.empty:
             return []
         data = df.rename(columns={"date": "trade_date", "amount": "volume"})
-        if "amount" not in data.columns:
-            data["amount"] = None
+        data["volume"] = pd.to_numeric(data.get("volume"), errors="coerce") * 100
+        data["close"] = pd.to_numeric(data.get("close"), errors="coerce")
+        data["amount"] = data["volume"] * data["close"]
         data["turnover_rate"] = None
         return self._finalize_daily_bar_df(data, symbol, "akshare_tx")
 
