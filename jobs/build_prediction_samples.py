@@ -294,7 +294,25 @@ def _build_prediction_export_frame(
         return pd.DataFrame(columns=PREDICTION_EXPORT_COLUMNS)
 
     target_ts = pd.Timestamp(effective_trade_date).normalize()
-    dataset = MultiInputInferenceDataset(context_prediction_df, seq_length=seq_length)
+    context_for_inference = context_prediction_df.copy()
+    context_for_inference["_trade_ts"] = pd.to_datetime(context_for_inference["trade_date"], errors="coerce").dt.normalize()
+    target_symbols = set(
+        context_for_inference.loc[context_for_inference["_trade_ts"] == target_ts, "symbol"].dropna().astype(str)
+    )
+    if not target_symbols:
+        return pd.DataFrame(columns=PREDICTION_EXPORT_COLUMNS)
+    context_for_inference["symbol"] = context_for_inference["symbol"].astype(str)
+    context_for_inference = context_for_inference[
+        (context_for_inference["symbol"].isin(target_symbols)) & (context_for_inference["_trade_ts"] <= target_ts)
+    ]
+    context_for_inference = (
+        context_for_inference.sort_values(["symbol", "_trade_ts"])
+        .groupby("symbol", group_keys=False)
+        .tail(int(seq_length))
+        .drop(columns=["_trade_ts"])
+    )
+
+    dataset = MultiInputInferenceDataset(context_for_inference, seq_length=seq_length)
     rows: list[dict[str, object]] = []
     for sample in dataset:
         sample_trade_ts = pd.Timestamp(sample.meta.get("trade_date")).normalize()
