@@ -70,8 +70,10 @@ def build_all_features(
     market = build_market_features(daily_bars, index_bars, sector_daily)
     market = _normalize_trade_date_column(market)
     merged = merged.merge(market, on="trade_date", how="left")
-    security_cols = securities[["symbol", "name", "industry", "board", "list_date", "is_st"]].copy()
-    security_cols = security_cols.rename(columns={"industry": "industry_sw"})
+    security_col_intersection = [c for c in ["symbol", "name", "industry", "board", "list_date", "is_st"] if c in securities.columns]
+    security_cols = securities[security_col_intersection].copy()
+    if "industry" in security_cols.columns:
+        security_cols = security_cols.rename(columns={"industry": "industry_sw"})
     merged = merged.merge(security_cols, on="symbol", how="left")
     first_trade_dates = (
         daily_bars[["symbol", "trade_date"]]

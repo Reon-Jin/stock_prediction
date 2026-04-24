@@ -242,10 +242,14 @@ class WarehouseRepository:
     def _normalize_value(value: Any) -> Any:
         if isinstance(value, (dict, list)):
             return json.dumps(value, ensure_ascii=False, default=str)
-        if pd.isna(value):
+        if value is None or (isinstance(value, float) and value != value):
             return None
         if isinstance(value, pd.Timestamp):
             return value.to_pydatetime()
+        if isinstance(value, np.generic):
+            if np.isnan(value):
+                return None
+            return value.item()
         return value
 
     @classmethod

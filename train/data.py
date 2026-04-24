@@ -29,6 +29,8 @@ from datasets.pytorch_dataset import (
     DEFAULT_SEQ_COLUMNS,
     DEFAULT_TAB_COLUMNS,
     EVENT_EMBEDDING_COLUMN,
+    DATA_AUGMENTATION_SOURCE_COLUMNS,
+    augment_aligned_features,
 )
 
 CACHE_VERSION = 7
@@ -273,79 +275,6 @@ def _build_neighbor_tensors(frame: pd.DataFrame, topk: int) -> tuple[torch.Tenso
         ids[idx] = _parse_fixed_int_array(id_values[idx], topk)
         scores[idx] = _parse_fixed_float_array(score_values[idx], topk)
     return torch.tensor(ids, dtype=torch.long), torch.tensor(scores, dtype=torch.float32)
-
-
-def _augment_aligned_features(frame: pd.DataFrame) -> pd.DataFrame:
-    augmented = frame.copy()
-
-    def numeric_series(column_name: str) -> pd.Series:
-        if column_name in augmented.columns:
-            return pd.to_numeric(augmented[column_name], errors="coerce")
-        return pd.Series(np.nan, index=augmented.index, dtype=float)
-
-    numeric_candidates = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "amount",
-        "turnover_rate",
-        "ret_5",
-        "ret_20",
-        "volatility_5",
-        "volatility_20",
-        "up_limit_count",
-        "down_limit_count",
-        "sector_hotness_top1",
-        "sector_hotness_top3_mean",
-        "risk_on_flag",
-        "risk_off_flag",
-    ]
-    existing_numeric = [column for column in numeric_candidates if column in augmented.columns]
-    if existing_numeric:
-        augmented[existing_numeric] = augmented[existing_numeric].apply(pd.to_numeric, errors="coerce")
-
-    close_price = numeric_series("close")
-    open_price = numeric_series("open")
-    high_price = numeric_series("high")
-    low_price = numeric_series("low")
-    amount = numeric_series("amount")
-    volume = numeric_series("volume")
-    turnover_rate = numeric_series("turnover_rate")
-    prev_close = close_price.groupby(augmented["symbol"]).shift(1)
-
-    close_base = close_price.replace(0, np.nan)
-    open_base = open_price.replace(0, np.nan)
-    prev_base = prev_close.replace(0, np.nan)
-    max_oc = pd.concat([open_price, close_price], axis=1).max(axis=1)
-    min_oc = pd.concat([open_price, close_price], axis=1).min(axis=1)
-
-    augmented["intraday_range"] = (high_price - low_price) / close_base
-    augmented["candle_body"] = (close_price - open_price) / open_base
-    augmented["upper_shadow"] = (high_price - max_oc) / open_base
-    augmented["lower_shadow"] = (min_oc - low_price) / open_base
-    augmented["gap_open_to_prev_close"] = (open_price - prev_close) / prev_base
-    augmented["close_to_prev_close"] = (close_price - prev_close) / prev_base
-    augmented["high_to_prev_close"] = (high_price - prev_close) / prev_base
-    augmented["low_to_prev_close"] = (low_price - prev_close) / prev_base
-    augmented["amount_log1p"] = np.log1p(amount.clip(lower=0))
-    augmented["volume_log1p"] = np.log1p(volume.clip(lower=0))
-    augmented["turnover_rate_delta"] = turnover_rate.groupby(augmented["symbol"]).diff()
-    augmented["ret_spread_5_20"] = numeric_series("ret_5") - numeric_series("ret_20")
-    augmented["volatility_ratio_5_20"] = numeric_series("volatility_5") / numeric_series("volatility_20").replace(0, np.nan)
-
-    up_limit = numeric_series("up_limit_count").fillna(0)
-    down_limit = numeric_series("down_limit_count").fillna(0)
-    top1 = numeric_series("sector_hotness_top1").fillna(0)
-    top3_mean = numeric_series("sector_hotness_top3_mean").fillna(0)
-    risk_on = numeric_series("risk_on_flag").fillna(0)
-    risk_off = numeric_series("risk_off_flag").fillna(0)
-    augmented["limit_count_spread"] = up_limit - down_limit
-    augmented["limit_count_ratio"] = (up_limit - down_limit) / (up_limit + down_limit + 1.0)
-    augmented["sector_hotness_spread"] = top1 - top3_mean
-    augmented["market_regime_score"] = risk_on - risk_off
-    return augmented
 
 
 def _ensure_derived_risk_labels(frame: pd.DataFrame) -> pd.DataFrame:
@@ -616,7 +545,7 @@ def prepare_split(
     frame = pd.read_parquet(source_path, columns=read_columns)
     frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.normalize()
     frame = frame.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
-    frame = _augment_aligned_features(frame)
+    frame = augment_aligned_features(frame)
     frame = _ensure_derived_risk_labels(frame)
     schema_columns = set(frame.columns)
     seq_columns = [column for column in DEFAULT_SEQ_COLUMNS if column in schema_columns]
@@ -753,7 +682,7 @@ def build_or_load_split(
         started_at = time.perf_counter()
         if verbose:
             print(f"[data] loading cached {split_name} split from {cache_path.name}")
-        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
         if (
             payload.get("cache_version") == CACHE_VERSION
             and payload.get("source_signature") == source_signature

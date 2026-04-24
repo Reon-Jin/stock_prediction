@@ -77,12 +77,14 @@ def run(
             sec_list_date = {}
             for row in securities[["symbol", "list_date"]].to_dict("records"):
                 sec_list_date[str(row["symbol"])] = row.get("list_date")
+            start_ts = pd.Timestamp(start)
+            trading_day_set = set(trading_days)
             filtered_symbols: list[str] = []
             skipped_completed = 0
             for symbol in selected_symbols:
                 list_date = sec_list_date.get(symbol)
-                start_ts = max(pd.Timestamp(start), pd.Timestamp(list_date)) if pd.notna(list_date) else pd.Timestamp(start)
-                expected_days = len([day for day in trading_days if pd.Timestamp(day) >= start_ts])
+                symbol_start = max(start_ts, pd.Timestamp(list_date)) if pd.notna(list_date) else start_ts
+                expected_days = sum(1 for day in trading_days if day >= symbol_start)
                 existing_days = existing_counts.get(symbol, 0)
                 if expected_days > 0 and existing_days >= expected_days:
                     skipped_completed += 1

@@ -112,6 +112,100 @@ DEFAULT_COMPANY_PROFILE_COLUMNS = [
     "gross_margin",
 ]
 
+DATA_AUGMENTATION_SOURCE_COLUMNS = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "turnover_rate",
+    "ret_5",
+    "ret_20",
+    "volatility_5",
+    "volatility_20",
+    "up_limit_count",
+    "down_limit_count",
+    "sector_hotness_top1",
+    "sector_hotness_top3_mean",
+    "risk_on_flag",
+    "risk_off_flag",
+]
+
+
+def augment_aligned_features(df: pd.DataFrame) -> pd.DataFrame:
+    frame = df.copy()
+
+    def numeric_series(column_name: str) -> pd.Series:
+        if column_name in frame.columns:
+            return pd.to_numeric(frame[column_name], errors="coerce")
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+
+    numeric_candidates = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "turnover_rate",
+        "ret_5",
+        "ret_20",
+        "volatility_5",
+        "volatility_20",
+        "up_limit_count",
+        "down_limit_count",
+        "sector_hotness_top1",
+        "sector_hotness_top3_mean",
+        "risk_on_flag",
+        "risk_off_flag",
+    ]
+    existing_numeric = [column for column in numeric_candidates if column in frame.columns]
+    if existing_numeric:
+        frame[existing_numeric] = frame[existing_numeric].apply(pd.to_numeric, errors="coerce")
+
+    close_price = numeric_series("close")
+    open_price = numeric_series("open")
+    high_price = numeric_series("high")
+    low_price = numeric_series("low")
+    amount = numeric_series("amount")
+    volume = numeric_series("volume")
+    turnover_rate = numeric_series("turnover_rate")
+    prev_close = close_price.groupby(frame["symbol"]).shift(1)
+
+    close_base = close_price.replace(0, np.nan)
+    open_base = open_price.replace(0, np.nan)
+    prev_base = prev_close.replace(0, np.nan)
+    max_oc = pd.concat([open_price, close_price], axis=1).max(axis=1)
+    min_oc = pd.concat([open_price, close_price], axis=1).min(axis=1)
+
+    frame["intraday_range"] = (high_price - low_price) / close_base
+    frame["candle_body"] = (close_price - open_price) / open_base
+    frame["upper_shadow"] = (high_price - max_oc) / open_base
+    frame["lower_shadow"] = (min_oc - low_price) / open_base
+    frame["gap_open_to_prev_close"] = (open_price - prev_close) / prev_base
+    frame["close_to_prev_close"] = (close_price - prev_close) / prev_base
+    frame["high_to_prev_close"] = (high_price - prev_close) / prev_base
+    frame["low_to_prev_close"] = (low_price - prev_close) / prev_base
+    frame["amount_log1p"] = np.log1p(amount.clip(lower=0))
+    frame["volume_log1p"] = np.log1p(volume.clip(lower=0))
+    frame["turnover_rate_delta"] = turnover_rate.groupby(frame["symbol"]).diff()
+    frame["ret_spread_5_20"] = numeric_series("ret_5") - numeric_series("ret_20")
+    frame["volatility_ratio_5_20"] = numeric_series("volatility_5") / numeric_series("volatility_20").replace(0, np.nan)
+
+    up_limit = numeric_series("up_limit_count").fillna(0)
+    down_limit = numeric_series("down_limit_count").fillna(0)
+    top1 = numeric_series("sector_hotness_top1").fillna(0)
+    top3_mean = numeric_series("sector_hotness_top3_mean").fillna(0)
+    risk_on = numeric_series("risk_on_flag").fillna(0)
+    risk_off = numeric_series("risk_off_flag").fillna(0)
+    frame["limit_count_spread"] = up_limit - down_limit
+    frame["limit_count_ratio"] = (up_limit - down_limit) / (up_limit + down_limit + 1.0)
+    frame["sector_hotness_spread"] = top1 - top3_mean
+    frame["market_regime_score"] = risk_on - risk_off
+    return frame
+
+
 DEFAULT_LABEL_GROUPS = {
     "p_win": ["label_win_3", "label_win_5", "label_win_10", "label_win_20", "label_win_40"],
     "ret_mu": ["label_ret_3", "label_ret_5", "label_ret_10", "label_ret_20", "label_ret_40"],
@@ -278,7 +372,7 @@ class MultiInputTrainingDataset(Dataset[MultiInputSample]):
         self.df = df.copy()
         self.df["trade_date"] = pd.to_datetime(self.df["trade_date"])
         self.df = self.df.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
-        self.df = self._augment_aligned_features(self.df)
+        self.df = augment_aligned_features(self.df)
 
         self.seq_length = int(seq_length)
         self.fillna_value = float(fillna_value)
@@ -334,78 +428,6 @@ class MultiInputTrainingDataset(Dataset[MultiInputSample]):
                 if not self._has_complete_labels(row_idx):
                     continue
                 self._row_positions.append((indices, offset, row_idx))
-
-    def _augment_aligned_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        frame = df.copy()
-
-        def numeric_series(column_name: str) -> pd.Series:
-            if column_name in frame.columns:
-                return pd.to_numeric(frame[column_name], errors="coerce")
-            return pd.Series(np.nan, index=frame.index, dtype=float)
-
-        numeric_candidates = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "amount",
-            "turnover_rate",
-            "ret_5",
-            "ret_20",
-            "volatility_5",
-            "volatility_20",
-            "up_limit_count",
-            "down_limit_count",
-            "sector_hotness_top1",
-            "sector_hotness_top3_mean",
-            "risk_on_flag",
-            "risk_off_flag",
-        ]
-        existing_numeric = [column for column in numeric_candidates if column in frame.columns]
-        if existing_numeric:
-            frame[existing_numeric] = frame[existing_numeric].apply(pd.to_numeric, errors="coerce")
-
-        close_price = numeric_series("close")
-        open_price = numeric_series("open")
-        high_price = numeric_series("high")
-        low_price = numeric_series("low")
-        amount = numeric_series("amount")
-        volume = numeric_series("volume")
-        turnover_rate = numeric_series("turnover_rate")
-        prev_close = close_price.groupby(frame["symbol"]).shift(1)
-
-        close_base = close_price.replace(0, np.nan)
-        open_base = open_price.replace(0, np.nan)
-        prev_base = prev_close.replace(0, np.nan)
-        max_oc = pd.concat([open_price, close_price], axis=1).max(axis=1)
-        min_oc = pd.concat([open_price, close_price], axis=1).min(axis=1)
-
-        frame["intraday_range"] = (high_price - low_price) / close_base
-        frame["candle_body"] = (close_price - open_price) / open_base
-        frame["upper_shadow"] = (high_price - max_oc) / open_base
-        frame["lower_shadow"] = (min_oc - low_price) / open_base
-        frame["gap_open_to_prev_close"] = (open_price - prev_close) / prev_base
-        frame["close_to_prev_close"] = (close_price - prev_close) / prev_base
-        frame["high_to_prev_close"] = (high_price - prev_close) / prev_base
-        frame["low_to_prev_close"] = (low_price - prev_close) / prev_base
-        frame["amount_log1p"] = np.log1p(amount.clip(lower=0))
-        frame["volume_log1p"] = np.log1p(volume.clip(lower=0))
-        frame["turnover_rate_delta"] = turnover_rate.groupby(frame["symbol"]).diff()
-        frame["ret_spread_5_20"] = numeric_series("ret_5") - numeric_series("ret_20")
-        frame["volatility_ratio_5_20"] = numeric_series("volatility_5") / numeric_series("volatility_20").replace(0, np.nan)
-
-        up_limit = numeric_series("up_limit_count").fillna(0)
-        down_limit = numeric_series("down_limit_count").fillna(0)
-        top1 = numeric_series("sector_hotness_top1").fillna(0)
-        top3_mean = numeric_series("sector_hotness_top3_mean").fillna(0)
-        risk_on = numeric_series("risk_on_flag").fillna(0)
-        risk_off = numeric_series("risk_off_flag").fillna(0)
-        frame["limit_count_spread"] = up_limit - down_limit
-        frame["limit_count_ratio"] = (up_limit - down_limit) / (up_limit + down_limit + 1.0)
-        frame["sector_hotness_spread"] = top1 - top3_mean
-        frame["market_regime_score"] = risk_on - risk_off
-        return frame
 
     def _existing_columns(self, requested: Sequence[str]) -> list[str]:
         return [column for column in requested if column in self.df.columns]

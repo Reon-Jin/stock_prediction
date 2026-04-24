@@ -19,7 +19,7 @@ project:
   seq_length: 20
 
 database:
-  url: mysql+pymysql://root:185258@127.0.0.1:3306/a_share_ml?charset=utf8mb4
+  url: mysql+pymysql://${DB_USER:-root}:${DB_PASSWORD:-185258}@127.0.0.1:3306/a_share_ml?charset=utf8mb4
   echo: false
   pool_pre_ping: true
   pool_recycle: 3600
@@ -79,7 +79,7 @@ llm:
   provider: deepseek
   base_url: https://api.deepseek.com
   model: deepseek-chat
-  api_key: sk-7480c85220c848788f68f245252f9f5d
+  api_key: ${LLM_API_KEY:-}
   temperature: 0.35
   max_context_messages: 12
 

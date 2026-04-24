@@ -221,7 +221,7 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> tuple[TinyMultiInputModel, FeatureNormalizer, dict[str, Any]]:
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_config = checkpoint.get("model_config", {})
     model = TinyMultiInputModel(
         input_dims=checkpoint["input_dims"],
