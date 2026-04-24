@@ -9,3 +9,4 @@
 /tests
 /.pytest_cache
 /.codex
+**/__pycache__
