@@ -78,8 +78,8 @@ runtime:
 llm:
   provider: deepseek
   base_url: https://api.deepseek.com
-  model: deepseek-chat
-  api_key: ${LLM_API_KEY:-}
+  model: deepseek-v4-flash
+  api_key: sk-8fdc8f36be134536bf6ade659e44437a
   temperature: 0.35
   max_context_messages: 12
 

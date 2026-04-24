@@ -17,8 +17,10 @@ def _resolve_env_vars(value: str) -> str:
 
     def _replace(match: re.Match[str]) -> str:
         var_name = match.group(1)
-        default = match.group(2)
-        return os.environ.get(var_name, default or "")
+        default = match.group(2) or ""
+        if default.startswith("-"):
+            default = default[1:]  # 去掉 :- 语法引入的前导横线
+        return os.environ.get(var_name, default)
 
     return _ENV_VAR_PATTERN.sub(_replace, value)
 
