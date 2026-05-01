@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,7 +37,7 @@ class BaseProvider:
         self._proxy_env_backup: dict[str, str] = {}
 
     def build_snapshot_path(self, domain: str, payload: dict[str, Any]) -> Path:
-        dt = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        dt = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         digest = hashlib.md5(repr(sorted(payload.items())).encode("utf-8")).hexdigest()[:12]
         return self.raw_cache_dir / domain / f"{dt}_{digest}.json"
 

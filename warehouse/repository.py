@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
+
+
+def _utcnow() -> datetime:
+    """Return naive datetime representing current UTC time."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 import numpy as np
 import pandas as pd
@@ -118,7 +123,7 @@ class WarehouseRepository:
             for column in table.primary_key.columns
             if getattr(column, "autoincrement", False) is True
         }
-        timestamp_now = datetime.utcnow()
+        timestamp_now = _utcnow()
 
         normalized_rows: list[dict[str, Any]] = []
         for row in rows:
@@ -181,7 +186,7 @@ class WarehouseRepository:
             for column in table.primary_key.columns
             if getattr(column, "autoincrement", False) is True
         }
-        timestamp_now = datetime.utcnow()
+        timestamp_now = _utcnow()
 
         provided_columns = [column for column in table_columns if column in df.columns and column not in auto_primary_keys]
         has_created_at = "created_at" in table_columns and "created_at" not in df.columns
@@ -274,7 +279,7 @@ class WarehouseRepository:
         with session_scope(self.session_factory) as session:
             job = JobRun(
                 job_name=job_name,
-                start_time=datetime.utcnow(),
+                start_time=_utcnow(),
                 status="running",
                 params_json=self._normalize_json_payload(params),
             )
@@ -295,7 +300,7 @@ class WarehouseRepository:
             job = session.get(JobRun, job_run_id)
             if job is None:
                 return
-            job.end_time = datetime.utcnow()
+            job.end_time = _utcnow()
             job.status = status
             job.rows_affected = rows_affected
             job.message = message

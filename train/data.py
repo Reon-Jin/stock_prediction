@@ -66,7 +66,7 @@ def _source_signature(path: Path) -> dict[str, Any]:
     return {
         "path": str(path.resolve()),
         "size": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
+        "mtime_s": int(stat.st_mtime),  # second-level granularity avoids cache invalidation on file touch
     }
 
 
