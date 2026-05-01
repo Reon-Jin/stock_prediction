@@ -320,11 +320,22 @@ def build_loss_context(bundle: DataBundle, device: torch.device) -> LossContext:
     p_win = bundle.train_split.labels["p_win"][indices]
     positive_rate = p_win.mean(dim=0).clamp(0.05, 0.95)
     pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(0.5, 3.0)
+
+    num_h = int(p_win.shape[1])
+    if num_h == 5:
+        p_win_hw = torch.tensor([0.8, 1.0, 1.2, 1.1, 0.9], dtype=torch.float32, device=device)
+        ret_mu_hw = torch.tensor([0.6, 1.0, 1.2, 1.1, 0.8], dtype=torch.float32, device=device)
+        risk_dd_hw = torch.tensor([0.7, 1.0, 1.2, 1.2, 0.9], dtype=torch.float32, device=device)
+    else:
+        p_win_hw = torch.ones(num_h, dtype=torch.float32, device=device)
+        ret_mu_hw = torch.ones(num_h, dtype=torch.float32, device=device)
+        risk_dd_hw = torch.ones(num_h, dtype=torch.float32, device=device)
+
     return LossContext(
         p_win_pos_weight=pos_weight.to(device),
-        p_win_horizon_weight=torch.tensor([0.8, 1.0, 1.2, 1.1, 0.9], dtype=torch.float32, device=device),
-        ret_mu_horizon_weight=torch.tensor([0.6, 1.0, 1.2, 1.1, 0.8], dtype=torch.float32, device=device),
-        risk_dd_horizon_weight=torch.tensor([0.7, 1.0, 1.2, 1.2, 0.9], dtype=torch.float32, device=device),
+        p_win_horizon_weight=p_win_hw,
+        ret_mu_horizon_weight=ret_mu_hw,
+        risk_dd_horizon_weight=risk_dd_hw,
     )
 
 
@@ -956,6 +967,79 @@ def print_metric_block(split_name: str, metrics: dict[str, Any]) -> None:
         print(f"  {split_name} topk_business_by_horizon: {topk_parts}")
 
 
+def _update_metrics_from_batch(
+    running: dict[str, Any],
+    batch: dict[str, Any],
+    outputs: dict[str, torch.Tensor],
+    loss: torch.Tensor,
+    parts: dict[str, torch.Tensor],
+    p_win_thresholds: torch.Tensor,
+) -> None:
+    """Update running metric accumulators with results from a single batch.
+
+    Shared between train_one_epoch and evaluate to eliminate duplicated metric tracking code.
+    """
+    batch_size = float(batch["X_seq"].size(0))
+    running["loss_sum"] += float(loss.detach().item()) * batch_size
+    running["sample_count"] += batch_size
+    for name in LOSS_PART_NAMES:
+        running[f"{name}_sum"] += float(parts[name].detach().item()) * batch_size
+
+    p_win_prob = torch.sigmoid(outputs["p_win"].detach())
+    p_win_pred = (p_win_prob >= p_win_thresholds.unsqueeze(0)).float()
+    p_win_true = batch["y"]["p_win"]
+    p_win_true_binary = (p_win_true >= 0.5).float()
+    p_win_pred_binary = (p_win_pred >= 0.5).float()
+    running["p_win_correct"] += float((p_win_pred == p_win_true).sum().item())
+    running["p_win_total"] += float(p_win_true.numel())
+    running["p_win_correct_by_head"] += (p_win_pred_binary == p_win_true_binary).sum(dim=0).double().cpu()
+    running["p_win_total_by_head"] += torch.full(
+        (p_win_true.size(1),),
+        float(p_win_true.size(0)),
+        dtype=torch.float64,
+    )
+    running["p_win_true_pos_by_head"] += p_win_true_binary.sum(dim=0).double().cpu()
+    running["p_win_true_neg_by_head"] += (1.0 - p_win_true_binary).sum(dim=0).double().cpu()
+    running["p_win_pred_pos_by_head"] += p_win_pred_binary.sum(dim=0).double().cpu()
+    running["p_win_true_positive_by_head"] += (
+        (p_win_pred_binary == 1.0) & (p_win_true_binary == 1.0)
+    ).sum(dim=0).double().cpu()
+    running["p_win_true_negative_by_head"] += (
+        (p_win_pred_binary == 0.0) & (p_win_true_binary == 0.0)
+    ).sum(dim=0).double().cpu()
+    running["p_win_prob_sum_by_head"] += p_win_prob.sum(dim=0).double().cpu()
+    running["ret_mu_abs"] += float(torch.abs(outputs["ret_mu"].detach() - batch["y"]["ret_mu"]).sum().item())
+    running["ret_mu_total"] += float(batch["y"]["ret_mu"].numel())
+    running["ret_mu_abs_by_head"] += torch.abs(
+        outputs["ret_mu"].detach() - batch["y"]["ret_mu"]
+    ).sum(dim=0).double().cpu()
+    running["ret_mu_total_by_head"] += torch.full(
+        (batch["y"]["ret_mu"].size(1),),
+        float(batch["y"]["ret_mu"].size(0)),
+        dtype=torch.float64,
+    )
+    running["risk_dd_abs"] += float(torch.abs(outputs["risk_dd"].detach() - batch["y"]["risk_dd"]).sum().item())
+    running["risk_dd_total"] += float(batch["y"]["risk_dd"].numel())
+    running["risk_dd_abs_by_head"] += torch.abs(
+        outputs["risk_dd"].detach() - batch["y"]["risk_dd"]
+    ).sum(dim=0).double().cpu()
+    running["risk_dd_total_by_head"] += torch.full(
+        (batch["y"]["risk_dd"].size(1),),
+        float(batch["y"]["risk_dd"].size(0)),
+        dtype=torch.float64,
+    )
+    rank_score_pred = torch.sigmoid(outputs["rank_score"].detach())
+    running["rank_score_abs"] += float(torch.abs(rank_score_pred - batch["y"]["rank_score"]).sum().item())
+    running["rank_score_total"] += float(batch["y"]["rank_score"].numel())
+    running["decision_score_chunks"].append(outputs["decision_score"].detach().float().cpu())
+    running["ret_mu_target_chunks"].append(batch["y"]["ret_mu"].detach().float().cpu())
+    running["risk_dd_target_chunks"].append(batch["y"]["risk_dd"].detach().float().cpu())
+    if "bigloss" in batch["y"]:
+        running["bigloss_target_chunks"].append(batch["y"]["bigloss"].detach().float().cpu())
+    if "aux" in batch and "date_idx" in batch["aux"]:
+        running["date_idx_chunks"].append(batch["aux"]["date_idx"].detach().long().cpu())
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -995,65 +1079,7 @@ def train_one_epoch(
         if ema is not None:
             ema.update(model)
 
-        batch_size = float(batch["X_seq"].size(0))
-        running["loss_sum"] += float(loss.detach().item()) * batch_size
-        running["sample_count"] += batch_size
-        for name in LOSS_PART_NAMES:
-            running[f"{name}_sum"] += float(parts[name].detach().item()) * batch_size
-
-        p_win_prob = torch.sigmoid(outputs["p_win"].detach())
-        p_win_pred = (p_win_prob >= p_win_thresholds.unsqueeze(0)).float()
-        p_win_true = batch["y"]["p_win"]
-        p_win_true_binary = (p_win_true >= 0.5).float()
-        p_win_pred_binary = (p_win_pred >= 0.5).float()
-        running["p_win_correct"] += float((p_win_pred == p_win_true).sum().item())
-        running["p_win_total"] += float(p_win_true.numel())
-        running["p_win_correct_by_head"] += (p_win_pred_binary == p_win_true_binary).sum(dim=0).double().cpu()
-        running["p_win_total_by_head"] += torch.full(
-            (p_win_true.size(1),),
-            float(p_win_true.size(0)),
-            dtype=torch.float64,
-        )
-        running["p_win_true_pos_by_head"] += p_win_true_binary.sum(dim=0).double().cpu()
-        running["p_win_true_neg_by_head"] += (1.0 - p_win_true_binary).sum(dim=0).double().cpu()
-        running["p_win_pred_pos_by_head"] += p_win_pred_binary.sum(dim=0).double().cpu()
-        running["p_win_true_positive_by_head"] += (
-            (p_win_pred_binary == 1.0) & (p_win_true_binary == 1.0)
-        ).sum(dim=0).double().cpu()
-        running["p_win_true_negative_by_head"] += (
-            (p_win_pred_binary == 0.0) & (p_win_true_binary == 0.0)
-        ).sum(dim=0).double().cpu()
-        running["p_win_prob_sum_by_head"] += p_win_prob.sum(dim=0).double().cpu()
-        running["ret_mu_abs"] += float(torch.abs(outputs["ret_mu"].detach() - batch["y"]["ret_mu"]).sum().item())
-        running["ret_mu_total"] += float(batch["y"]["ret_mu"].numel())
-        running["ret_mu_abs_by_head"] += torch.abs(
-            outputs["ret_mu"].detach() - batch["y"]["ret_mu"]
-        ).sum(dim=0).double().cpu()
-        running["ret_mu_total_by_head"] += torch.full(
-            (batch["y"]["ret_mu"].size(1),),
-            float(batch["y"]["ret_mu"].size(0)),
-            dtype=torch.float64,
-        )
-        running["risk_dd_abs"] += float(torch.abs(outputs["risk_dd"].detach() - batch["y"]["risk_dd"]).sum().item())
-        running["risk_dd_total"] += float(batch["y"]["risk_dd"].numel())
-        running["risk_dd_abs_by_head"] += torch.abs(
-            outputs["risk_dd"].detach() - batch["y"]["risk_dd"]
-        ).sum(dim=0).double().cpu()
-        running["risk_dd_total_by_head"] += torch.full(
-            (batch["y"]["risk_dd"].size(1),),
-            float(batch["y"]["risk_dd"].size(0)),
-            dtype=torch.float64,
-        )
-        rank_score_pred = torch.sigmoid(outputs["rank_score"].detach())
-        running["rank_score_abs"] += float(torch.abs(rank_score_pred - batch["y"]["rank_score"]).sum().item())
-        running["rank_score_total"] += float(batch["y"]["rank_score"].numel())
-        running["decision_score_chunks"].append(outputs["decision_score"].detach().float().cpu())
-        running["ret_mu_target_chunks"].append(batch["y"]["ret_mu"].detach().float().cpu())
-        running["risk_dd_target_chunks"].append(batch["y"]["risk_dd"].detach().float().cpu())
-        if "bigloss" in batch["y"]:
-            running["bigloss_target_chunks"].append(batch["y"]["bigloss"].detach().float().cpu())
-        if "aux" in batch and "date_idx" in batch["aux"]:
-            running["date_idx_chunks"].append(batch["aux"]["date_idx"].detach().long().cpu())
+        _update_metrics_from_batch(running, batch, outputs, loss, parts, p_win_thresholds)
 
         metrics = _finalize_metrics(running)
         progress.set_postfix(
@@ -1098,65 +1124,7 @@ def evaluate(
             outputs = model(batch)
             loss, parts = compute_losses(outputs, batch["y"], config, loss_context, aux_targets=batch.get("aux"))
 
-        batch_size = float(batch["X_seq"].size(0))
-        running["loss_sum"] += float(loss.detach().item()) * batch_size
-        running["sample_count"] += batch_size
-        for name in LOSS_PART_NAMES:
-            running[f"{name}_sum"] += float(parts[name].detach().item()) * batch_size
-
-        p_win_prob = torch.sigmoid(outputs["p_win"].detach())
-        p_win_pred = (p_win_prob >= resolved_thresholds.unsqueeze(0)).float()
-        p_win_true = batch["y"]["p_win"]
-        p_win_true_binary = (p_win_true >= 0.5).float()
-        p_win_pred_binary = (p_win_pred >= 0.5).float()
-        running["p_win_correct"] += float((p_win_pred == p_win_true).sum().item())
-        running["p_win_total"] += float(p_win_true.numel())
-        running["p_win_correct_by_head"] += (p_win_pred_binary == p_win_true_binary).sum(dim=0).double().cpu()
-        running["p_win_total_by_head"] += torch.full(
-            (p_win_true.size(1),),
-            float(p_win_true.size(0)),
-            dtype=torch.float64,
-        )
-        running["p_win_true_pos_by_head"] += p_win_true_binary.sum(dim=0).double().cpu()
-        running["p_win_true_neg_by_head"] += (1.0 - p_win_true_binary).sum(dim=0).double().cpu()
-        running["p_win_pred_pos_by_head"] += p_win_pred_binary.sum(dim=0).double().cpu()
-        running["p_win_true_positive_by_head"] += (
-            (p_win_pred_binary == 1.0) & (p_win_true_binary == 1.0)
-        ).sum(dim=0).double().cpu()
-        running["p_win_true_negative_by_head"] += (
-            (p_win_pred_binary == 0.0) & (p_win_true_binary == 0.0)
-        ).sum(dim=0).double().cpu()
-        running["p_win_prob_sum_by_head"] += p_win_prob.sum(dim=0).double().cpu()
-        running["ret_mu_abs"] += float(torch.abs(outputs["ret_mu"].detach() - batch["y"]["ret_mu"]).sum().item())
-        running["ret_mu_total"] += float(batch["y"]["ret_mu"].numel())
-        running["ret_mu_abs_by_head"] += torch.abs(
-            outputs["ret_mu"].detach() - batch["y"]["ret_mu"]
-        ).sum(dim=0).double().cpu()
-        running["ret_mu_total_by_head"] += torch.full(
-            (batch["y"]["ret_mu"].size(1),),
-            float(batch["y"]["ret_mu"].size(0)),
-            dtype=torch.float64,
-        )
-        running["risk_dd_abs"] += float(torch.abs(outputs["risk_dd"].detach() - batch["y"]["risk_dd"]).sum().item())
-        running["risk_dd_total"] += float(batch["y"]["risk_dd"].numel())
-        running["risk_dd_abs_by_head"] += torch.abs(
-            outputs["risk_dd"].detach() - batch["y"]["risk_dd"]
-        ).sum(dim=0).double().cpu()
-        running["risk_dd_total_by_head"] += torch.full(
-            (batch["y"]["risk_dd"].size(1),),
-            float(batch["y"]["risk_dd"].size(0)),
-            dtype=torch.float64,
-        )
-        rank_score_pred = torch.sigmoid(outputs["rank_score"].detach())
-        running["rank_score_abs"] += float(torch.abs(rank_score_pred - batch["y"]["rank_score"]).sum().item())
-        running["rank_score_total"] += float(batch["y"]["rank_score"].numel())
-        running["decision_score_chunks"].append(outputs["decision_score"].detach().float().cpu())
-        running["ret_mu_target_chunks"].append(batch["y"]["ret_mu"].detach().float().cpu())
-        running["risk_dd_target_chunks"].append(batch["y"]["risk_dd"].detach().float().cpu())
-        if "bigloss" in batch["y"]:
-            running["bigloss_target_chunks"].append(batch["y"]["bigloss"].detach().float().cpu())
-        if "aux" in batch and "date_idx" in batch["aux"]:
-            running["date_idx_chunks"].append(batch["aux"]["date_idx"].detach().long().cpu())
+        _update_metrics_from_batch(running, batch, outputs, loss, parts, resolved_thresholds)
 
         metrics = _finalize_metrics(running)
         progress.set_postfix(

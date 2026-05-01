@@ -198,12 +198,10 @@ def _normalize_preference(value: str | None) -> str:
     aliases = {
         "conservative_cn": "conservative",
         "conservative": "conservative",
-        "conservative": "conservative",
         "balanced_cn": "balanced",
         "balanced": "balanced",
         "aggressive_cn": "aggressive",
         "aggressive_cn2": "aggressive",
-        "aggressive": "aggressive",
         "aggressive": "aggressive",
     }
     return aliases.get(raw, "balanced")
@@ -805,7 +803,6 @@ def _build_reasons(
     if summary.get("conflict_state"):
         reasons.append(f"Cross-horizon conflict: {summary['conflict_state']}, type={summary.get('conflict_type')}.")
     else:
-        reasons.append("No obvious cross-horizon conflict.")
         reasons.append("No obvious cross-horizon conflict.")
     for message in risk_review["warnings"]:
         reasons.append(f"Risk note: {message}")

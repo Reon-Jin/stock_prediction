@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     JSON,
@@ -19,6 +19,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
+def _utcnow() -> datetime:
+    """Return naive datetime representing current UTC time."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -27,9 +32,9 @@ class VersionMixin:
     data_version: Mapped[str] = mapped_column(String(32), nullable=False, default="v1")
     feature_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     label_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
 
@@ -270,9 +275,9 @@ class CompanyProfile(Base):
     debt_ratio: Mapped[float | None] = mapped_column(Float)
     gross_margin: Mapped[float | None] = mapped_column(Float)
     profile_version: Mapped[str] = mapped_column(String(32), nullable=False, default="cp1")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
     )
     __table_args__ = (
         UniqueConstraint("symbol", "asof_date", name="uq_company_profiles_symbol_asof"),
@@ -290,9 +295,9 @@ class CompanySimilarity(Base):
     sim_rank: Mapped[int] = mapped_column(Integer, nullable=False)
     similarity_version: Mapped[str] = mapped_column(String(32), nullable=False, default="cs1")
     asof_date: Mapped[date | None] = mapped_column(Date)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
     )
     __table_args__ = (
         UniqueConstraint("symbol", "neighbor_symbol", "similarity_version", name="uq_company_similarity_pair_version"),
@@ -309,9 +314,9 @@ class UserAccount(Base):
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
     __table_args__ = (
@@ -335,9 +340,9 @@ class AnalysisSession(Base):
     latest_analysis_json: Mapped[dict | None] = mapped_column(JSON)
     last_user_message: Mapped[str | None] = mapped_column(Text)
     last_assistant_message: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
     )
     __table_args__ = (
         Index("idx_analysis_sessions_user_updated", "user_id", "updated_at"),
@@ -353,9 +358,9 @@ class AnalysisMessage(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     payload_json: Mapped[dict | None] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
     )
     __table_args__ = (
         Index("idx_analysis_messages_session_created", "session_id", "created_at"),
@@ -477,7 +482,7 @@ class JobRun(Base):
     __tablename__ = "job_runs"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     job_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    start_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    start_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
     end_time: Mapped[datetime | None] = mapped_column(DateTime)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     message: Mapped[str | None] = mapped_column(Text)
@@ -492,5 +497,5 @@ class BadRecord(Base):
     business_key: Mapped[str | None] = mapped_column(String(256))
     payload: Mapped[dict | None] = mapped_column(JSON)
     error_message: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     __table_args__ = (Index("idx_bad_records_domain", "domain"),)

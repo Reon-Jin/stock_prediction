@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,11 +56,18 @@ from webapp.services import (
 )
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    bootstrap_web_app()
+    yield
+
+
 app = FastAPI(
     title="A股智能分析平台",
     version="1.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -68,11 +77,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    bootstrap_web_app()
 
 
 def get_current_user(
@@ -102,7 +106,7 @@ def build_auth_response(user: UserAccount) -> AuthTokenResponse:
 
 @app.get("/api/health")
 def health_check() -> dict[str, str]:
-    return {"status": "ok", "server_time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "server_time": datetime.now(timezone.utc).isoformat()}
 
 
 @app.post("/api/auth/register", response_model=AuthTokenResponse)
@@ -150,7 +154,7 @@ def login(payload: LoginRequest, session: Session = Depends(iter_db)) -> AuthTok
     user = find_user_by_account(session, payload.account)
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="账号或密码错误。")
-    user.last_login_at = datetime.utcnow()
+    user.last_login_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(user)
     return build_auth_response(user)
