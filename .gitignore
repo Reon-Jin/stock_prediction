@@ -10,3 +10,4 @@
 /.pytest_cache
 /.codex
 **/__pycache__
+.vite
