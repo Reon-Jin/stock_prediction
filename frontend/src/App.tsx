@@ -1,6 +1,7 @@
 import { AnimatePresence } from "framer-motion";
 import { LoaderCircle } from "lucide-react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { AppShell } from "./layouts/AppShell";
 import { useAuth } from "./lib/auth";
 import { DashboardPage } from "./pages/DashboardPage";
@@ -32,18 +33,20 @@ export default function App() {
   }
 
   return (
-    <AnimatePresence mode="wait">
-      <Routes location={location} key={location.pathname}>
-        <Route path="/login" element={user ? <Navigate to="/app/overview" replace /> : <LoginPage />} />
-        <Route path="/register" element={user ? <Navigate to="/app/overview" replace /> : <RegisterPage />} />
-        <Route path="/app" element={<ProtectedRoutes />}>
-          <Route path="overview" element={<DashboardPage />} />
-          <Route path="single-analysis" element={<SingleAnalysisPage />} />
-          <Route path="market-scan" element={<MarketScanPage />} />
-          <Route path="placeholders" element={<PlaceholdersPage />} />
-        </Route>
-        <Route path="*" element={<Navigate to={user ? "/app/overview" : "/login"} replace />} />
-      </Routes>
-    </AnimatePresence>
+    <ErrorBoundary>
+      <AnimatePresence mode="wait">
+        <Routes location={location} key={location.pathname}>
+          <Route path="/login" element={user ? <Navigate to="/app/overview" replace /> : <LoginPage />} />
+          <Route path="/register" element={user ? <Navigate to="/app/overview" replace /> : <RegisterPage />} />
+          <Route path="/app" element={<ProtectedRoutes />}>
+            <Route path="overview" element={<DashboardPage />} />
+            <Route path="single-analysis" element={<SingleAnalysisPage />} />
+            <Route path="market-scan" element={<MarketScanPage />} />
+            <Route path="placeholders" element={<PlaceholdersPage />} />
+          </Route>
+          <Route path="*" element={<Navigate to={user ? "/app/overview" : "/login"} replace />} />
+        </Routes>
+      </AnimatePresence>
+    </ErrorBoundary>
   );
 }
