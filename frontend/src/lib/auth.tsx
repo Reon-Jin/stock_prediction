@@ -65,7 +65,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
       token,
       loading,
       login: async (account, password) => {
-        const response = await api.post<AuthResponse>("/auth/login", { account, password }, null, 8000);
+        const response = await api.post<AuthResponse>("/auth/login", { account, password });
         saveAuth(response);
       },
       register: async (payload) => {

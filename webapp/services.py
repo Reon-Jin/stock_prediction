@@ -187,7 +187,14 @@ def iter_db() -> Session:
 
 
 def get_secret_key() -> str:
-    return f"{PROJECT_ROOT.name}-stock-ui-secret"
+    import os
+    key = os.environ.get("JWT_SECRET_KEY")
+    if not key:
+        raise RuntimeError(
+            "JWT_SECRET_KEY 环境变量未设置。"
+            "请运行: export JWT_SECRET_KEY=<your-secret-key>"
+        )
+    return key
 
 
 def _to_iso(value: Any) -> str | None:

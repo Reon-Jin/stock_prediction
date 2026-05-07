@@ -39,7 +39,7 @@ type StreamHandlers = {
   onEvent: (event: string, payload: any) => void;
 };
 
-async function stream(path: string, body: unknown, token: string, handlers: StreamHandlers) {
+async function stream(path: string, body: unknown, token: string, handlers: StreamHandlers, signal?: AbortSignal) {
   const response = await fetch(`${API_PREFIX}${path}`, {
     method: "POST",
     headers: {
@@ -48,6 +48,7 @@ async function stream(path: string, body: unknown, token: string, handlers: Stre
       Accept: "text/event-stream",
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!response.ok) {
@@ -77,8 +78,12 @@ async function stream(path: string, body: unknown, token: string, handlers: Stre
       return;
     }
     const raw = dataLines.join("\n");
-    const payload = JSON.parse(raw);
-    handlers.onEvent(event, payload);
+    try {
+      const payload = JSON.parse(raw);
+      handlers.onEvent(event, payload);
+    } catch {
+      console.warn("SSE: failed to parse data block:", raw);
+    }
   };
 
   while (true) {
@@ -109,5 +114,6 @@ export const api = {
     request<T>(path, { method: "POST", body: JSON.stringify(body) }, token, timeoutMs),
   delete: <T>(path: string, token?: string | null, timeoutMs?: number) =>
     request<T>(path, { method: "DELETE" }, token, timeoutMs),
-  stream,
+  stream: (path: string, body: unknown, token: string, handlers: StreamHandlers, signal?: AbortSignal) =>
+    stream(path, body, token, handlers, signal),
 };

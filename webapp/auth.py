@@ -20,7 +20,14 @@ def validate_username(username: str) -> bool:
 
 def validate_email(email: str) -> bool:
     value = email.strip()
-    return "@" in value and "." in value.split("@")[-1]
+    if "@" not in value:
+        return False
+    local, _, domain = value.rpartition("@")
+    if not local or not domain:
+        return False
+    if "." not in domain or domain.startswith(".") or domain.endswith("."):
+        return False
+    return True
 
 
 def hash_password(password: str) -> str:
