@@ -284,6 +284,22 @@ def _get_reusable_single_session_id(user_id: int, session_id: int | None, symbol
         session.close()
 
 
+def _get_reusable_market_scan_session_id(user_id: int, session_id: int | None) -> int | None:
+    if session_id is None:
+        return None
+    session_factory = get_session_factory()
+    session = session_factory()
+    try:
+        session_obj = session.get(AnalysisSession, int(session_id))
+        if session_obj is None or int(session_obj.user_id) != int(user_id):
+            raise ValueError("Session not found or access denied.")
+        if session_obj.symbol != MARKET_SCAN_SYMBOL:
+            raise ValueError("Session not found or access denied.")
+        return int(session_obj.id)
+    finally:
+        session.close()
+
+
 def _append_message(user_id: int, session_id: int, role: str, content: str, payload_json: dict[str, Any] | None = None) -> AnalysisMessage:
     session_factory = get_session_factory()
     session = session_factory()
@@ -648,9 +664,10 @@ def stream_market_scan_chat(
     message: str | None,
     refresh_analysis: bool,
 ) -> Iterator[str]:
+    reusable_session_id = _get_reusable_market_scan_session_id(int(user.id), session_id)
     session_obj, _ = _prepare_session(
         int(user.id),
-        session_id=session_id,
+        session_id=reusable_session_id,
         symbol=MARKET_SCAN_SYMBOL,
         is_holding=False,
         holding_days=int(top_n),

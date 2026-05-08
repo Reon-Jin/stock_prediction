@@ -115,7 +115,7 @@ type MarketScanWorkspaceValue = {
   selectSession: (session: AnalysisSessionSummary | null) => Promise<void>;
   resetView: () => void;
   loadSessions: (preferredSessionId?: number) => Promise<void>;
-  sendStream: (refreshAnalysis: boolean) => Promise<void>;
+  sendStream: (refreshAnalysis: boolean, reuseCurrentSession?: boolean) => Promise<void>;
   deleteSession: (sessionId: number) => Promise<void>;
 };
 
@@ -377,7 +377,7 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
   );
 
   const sendMarketStream = useCallback(
-    async (refreshAnalysis: boolean) => {
+    async (refreshAnalysis: boolean, reuseCurrentSession = !refreshAnalysis) => {
       if (!token) return;
       setMarketSending(true);
       setMarketError("");
@@ -387,7 +387,7 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
         await api.stream(
           "/analysis/market-scan/stream",
           {
-            session_id: marketCurrentSession?.id ?? null,
+            session_id: reuseCurrentSession ? (marketCurrentSession?.id ?? null) : null,
             top_n: marketForm.top_n,
             scan_mode: marketForm.scan_mode,
             message: marketDraft,

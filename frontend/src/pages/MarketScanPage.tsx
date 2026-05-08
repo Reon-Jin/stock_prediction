@@ -87,7 +87,7 @@ export function MarketScanPage() {
 
   const handleRecommend = async (event: FormEvent) => {
     event.preventDefault();
-    await sendStream(true);
+    await sendStream(true, false);
   };
 
   const handleFollowup = async (event: FormEvent) => {
@@ -284,7 +284,7 @@ export function MarketScanPage() {
                     <MessageSquare size={16} />
                     <h3>AI分析</h3>
                   </div>
-                  <button className="ghost-button" type="button" onClick={() => void sendStream(true)} disabled={sending}>
+                  <button className="ghost-button" type="button" onClick={() => void sendStream(true, true)} disabled={sending}>
                     <RefreshCw size={16} />
                     刷新本次推荐
                   </button>
