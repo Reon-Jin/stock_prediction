@@ -73,6 +73,7 @@ type SingleAnalysisForm = {
 type MarketScanForm = {
   top_n: number;
   scan_mode: "market" | "quick" | "direct";
+  holding_days: 3 | 5 | 10 | 20 | 40;
 };
 
 type SingleAnalysisWorkspaceValue = {
@@ -143,7 +144,7 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
   const [singleSending, setSingleSending] = useState(false);
   const [singleError, setSingleError] = useState("");
 
-  const [marketForm, setMarketFormState] = useState<MarketScanForm>({ top_n: 12, scan_mode: "market" });
+  const [marketForm, setMarketFormState] = useState<MarketScanForm>({ top_n: 12, scan_mode: "market", holding_days: 10 });
   const [marketSessions, setMarketSessions] = useState<AnalysisSessionSummary[]>([]);
   const [marketCurrentSession, setMarketCurrentSession] = useState<AnalysisSessionSummary | null>(null);
   const [marketMessages, setMarketMessages] = useState<AnalysisMessage[]>([]);
@@ -266,7 +267,10 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
         const marketResult = (detail.latest_analysis as MarketScanResult | null) || null;
         const detailTopN = Number(marketResult?.top_n || detail.holding_days || 12);
         const detailMode = marketResult?.scan_mode === "quick" ? "quick" : (marketResult?.scan_mode === "direct" ? "direct" : "market");
-        setMarketFormState({ top_n: detailTopN, scan_mode: detailMode });
+        const detailHoldingDays = ([3, 5, 10, 20, 40].includes(Number(marketResult?.holding_days))
+          ? Number(marketResult?.holding_days)
+          : 10) as MarketScanForm["holding_days"];
+        setMarketFormState({ top_n: detailTopN, scan_mode: detailMode, holding_days: detailHoldingDays });
       } catch (err) {
         setMarketError(err instanceof Error ? err.message : "鍔犺浇浼氳瘽澶辫触");
       }
@@ -390,6 +394,7 @@ export function AnalysisWorkspaceProvider({ children }: PropsWithChildren) {
             session_id: reuseCurrentSession ? (marketCurrentSession?.id ?? null) : null,
             top_n: marketForm.top_n,
             scan_mode: marketForm.scan_mode,
+            holding_days: marketForm.holding_days,
             message: marketDraft,
             refresh_analysis: refreshAnalysis,
           },

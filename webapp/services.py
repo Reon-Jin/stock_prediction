@@ -73,6 +73,15 @@ MARKET_SCAN_FULL_DAILY_COVERAGE_RATIO = 0.9
 MARKET_SCAN_FULL_MIN_SAMPLE_RATIO = 0.05
 
 
+def _normalize_market_scan_holding_days(value: int | None) -> int | None:
+    if value is None:
+        return None
+    holding_days = int(value)
+    if holding_days not in P_WIN_HORIZONS:
+        raise ValueError("推荐持有天数必须是 3、5、10、20、40 之一")
+    return holding_days
+
+
 @dataclass(frozen=True)
 class PredictionBundle:
     model: Any
@@ -1542,6 +1551,7 @@ def build_market_scan(
     target_date: str | None,
     risk_preference: str = "balanced",
     scan_mode: str = "market",
+    holding_days: int = 10,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     return build_market_scan_v2(
@@ -1549,6 +1559,7 @@ def build_market_scan(
         target_date=target_date,
         risk_preference=risk_preference,
         scan_mode=scan_mode,
+        holding_days=holding_days,
         progress=progress,
     )
 def _simple_rank_candidates(
@@ -1557,6 +1568,7 @@ def _simple_rank_candidates(
     risk_preference: str = "balanced",
     metadata: dict[str, Any] | None = None,
     p_win_thresholds: dict[int, float] | None = None,
+    holding_days: int | None = None,
 ) -> dict[str, Any]:
     del risk_preference
     if not records:
@@ -1571,13 +1583,14 @@ def _simple_rank_candidates(
 
     horizons = tuple(int(item) for item in P_WIN_HORIZONS)
     thresholds = p_win_thresholds or {h: 0.5 for h in horizons}
+    selected_holding_days = _normalize_market_scan_holding_days(holding_days)
 
     def _horizon_label(days: int) -> str:
         return f"{int(days)}d"
 
     enriched: list[dict[str, Any]] = []
     for record in records:
-        best_horizon = max(
+        best_horizon = selected_holding_days or max(
             horizons,
             key=lambda horizon: _calibrate_probability_against_threshold(
                 _safe_float(record.get(f"p_win_prob_{horizon}"), -1.0),
@@ -1719,6 +1732,7 @@ def _simple_rank_candidates(
 
     return {
         "effective_trade_date": str(records[0].get("trade_date") or ""),
+        "holding_days": selected_holding_days,
         "top_n": int(top_n),
         "pool_size": len(enriched),
         "selected_count": len(candidates),
@@ -1734,6 +1748,7 @@ def _build_market_scan_market_full(
     checkpoint_path: Path | None,
     config: AppConfig,
     risk_preference: str,
+    holding_days: int,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     coverage_before_refresh = _active_daily_bar_count_for_date(analysis_date)
@@ -1879,9 +1894,11 @@ def _build_market_scan_market_full(
             merged["feature_version"].iloc[0] if "feature_version" in merged.columns and not merged.empty else None,
         ),
         p_win_thresholds=p_win_thresholds,
+        holding_days=holding_days,
     )
     return {
         "effective_trade_date": effective_trade_date,
+        "holding_days": int(holding_days),
         "sample_size": int(len(raw_df)),
         "market_total_candidates": market_total_candidates,
         "total_candidates": int(len(merged)),
@@ -1895,12 +1912,14 @@ def build_market_scan_v2_final(
     target_date: str | None,
     risk_preference: str = "balanced",
     scan_mode: str = "market",
+    holding_days: int = 10,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = get_latest_checkpoint_path()
     config = get_app_config()
     analysis_date = _resolve_analysis_target_date(target_date)
     normalized_scan_mode = _normalize_scan_mode(scan_mode)
+    selected_holding_days = _normalize_market_scan_holding_days(holding_days) or 10
 
     if normalized_scan_mode == "quick":
         ranking = _build_market_scan_quick_incremental(
@@ -1908,6 +1927,7 @@ def build_market_scan_v2_final(
             analysis_date=analysis_date,
             checkpoint_path=checkpoint_path,
             config=config,
+            holding_days=selected_holding_days,
             progress=progress,
         )
     else:
@@ -1917,6 +1937,7 @@ def build_market_scan_v2_final(
             checkpoint_path=checkpoint_path,
             config=config,
             risk_preference=risk_preference,
+            holding_days=selected_holding_days,
             progress=progress,
         )
 
@@ -1926,6 +1947,7 @@ def build_market_scan_v2_final(
         "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
         "engine_version": ENGINE_VERSION,
         "scan_mode": normalized_scan_mode,
+        "holding_days": selected_holding_days,
         "sample_size": int(ranking["sample_size"]),
         "market_total_candidates": int(ranking["market_total_candidates"]),
         "total_candidates": int(ranking["total_candidates"]),
@@ -2034,10 +2056,13 @@ def _rank_market_scan_quick_threshold(
     records: list[Mapping[str, Any]],
     *,
     top_n: int,
+    holding_days: int,
 ) -> dict[str, Any]:
+    selected_holding_days = _normalize_market_scan_holding_days(holding_days) or 10
     if not records:
         return {
             "effective_trade_date": None,
+            "holding_days": selected_holding_days,
             "top_n": int(top_n),
             "pool_size": 0,
             "selected_count": 0,
@@ -2051,8 +2076,10 @@ def _rank_market_scan_quick_threshold(
         best_p_win = _safe_float(record.get("quick_hit_win_rate"), -1.0)
         best_ret_mu = _safe_float(record.get("quick_best_ret_mu"))
         if best_horizon <= 0 or best_p_win < 0:
-            best_horizon, raw_best_p_win, best_ret_mu = _best_short_horizon(record)
-            best_p_win = raw_best_p_win
+            best_horizon = selected_holding_days
+            raw_p_win = _safe_float(record.get(f"p_win_prob_{best_horizon}"), 0.0)
+            best_p_win = raw_p_win
+            best_ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
         if best_p_win < MARKET_SCAN_QUICK_MIN_WIN_RATE or best_ret_mu <= MARKET_SCAN_QUICK_MIN_RET_MU:
             continue
         selected_rows.append(
@@ -2100,6 +2127,8 @@ def _rank_market_scan_quick_threshold(
                 "S_3": _safe_float(record.get("p_win_prob_3")),
                 "S_5": _safe_float(record.get("p_win_prob_5")),
                 "S_10": _safe_float(record.get("p_win_prob_10")),
+                "S_20": _safe_float(record.get("p_win_prob_20")),
+                "S_40": _safe_float(record.get("p_win_prob_40")),
                 "consistency": 0.0,
                 "R_score": best_p_win,
             },
@@ -2148,12 +2177,18 @@ def _rank_market_scan_quick_threshold(
                     "p_win_prob_3": _safe_float(record.get("p_win_prob_3")),
                     "p_win_prob_5": _safe_float(record.get("p_win_prob_5")),
                     "p_win_prob_10": _safe_float(record.get("p_win_prob_10")),
+                    "p_win_prob_20": _safe_float(record.get("p_win_prob_20")),
+                    "p_win_prob_40": _safe_float(record.get("p_win_prob_40")),
                     "ret_mu_pred_3": _safe_float(record.get("ret_mu_pred_3")),
                     "ret_mu_pred_5": _safe_float(record.get("ret_mu_pred_5")),
                     "ret_mu_pred_10": _safe_float(record.get("ret_mu_pred_10")),
+                    "ret_mu_pred_20": _safe_float(record.get("ret_mu_pred_20")),
+                    "ret_mu_pred_40": _safe_float(record.get("ret_mu_pred_40")),
                     "risk_dd_pred_3": _safe_float(record.get("risk_dd_pred_3")),
                     "risk_dd_pred_5": _safe_float(record.get("risk_dd_pred_5")),
                     "risk_dd_pred_10": _safe_float(record.get("risk_dd_pred_10")),
+                    "risk_dd_pred_20": _safe_float(record.get("risk_dd_pred_20")),
+                    "risk_dd_pred_40": _safe_float(record.get("risk_dd_pred_40")),
                     "market_regime_prob": _safe_float(record.get("market_regime_prob"), 0.5),
                 },
                 "market_snapshot": {
@@ -2174,6 +2209,7 @@ def _rank_market_scan_quick_threshold(
 
     return {
         "effective_trade_date": str(records[0].get("trade_date") or ""),
+        "holding_days": selected_holding_days,
         "top_n": int(top_n),
         "pool_size": len(selected_rows),
         "selected_count": len(candidates),
@@ -2235,8 +2271,10 @@ def _build_market_scan_quick_incremental(
     analysis_date: str,
     checkpoint_path: Path | None,
     config: AppConfig,
+    holding_days: int,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    selected_holding_days = _normalize_market_scan_holding_days(holding_days) or 10
     active_symbols = _list_active_market_symbols()
     if not active_symbols:
         raise ValueError("quick market scan has no active symbols to scan")
@@ -2329,20 +2367,13 @@ def _build_market_scan_quick_incremental(
             for row in merged.to_dict(orient="records")
         ]
         for record in batch_records:
-            best_horizon = 3
-            best_hit_win_rate = -1.0
-            best_raw_p_win = -1.0
-            best_ret_mu = 0.0
-            for horizon in (3, 5, 10):
-                raw_p_win = _safe_float(record.get(f"p_win_prob_{horizon}"), 0.0)
-                hit_win_rate = _calibrate_probability_against_threshold(raw_p_win, threshold_map.get(horizon, 0.5))
-                ret_mu = _safe_float(record.get(f"ret_mu_pred_{horizon}"))
-                candidate = (hit_win_rate, raw_p_win, ret_mu, -horizon)
-                if candidate > (best_hit_win_rate, best_raw_p_win, best_ret_mu, -best_horizon):
-                    best_horizon = int(horizon)
-                    best_hit_win_rate = float(hit_win_rate)
-                    best_raw_p_win = float(raw_p_win)
-                    best_ret_mu = float(ret_mu)
+            best_horizon = selected_holding_days
+            best_raw_p_win = _safe_float(record.get(f"p_win_prob_{best_horizon}"), 0.0)
+            best_hit_win_rate = _calibrate_probability_against_threshold(
+                best_raw_p_win,
+                threshold_map.get(best_horizon, 0.5),
+            )
+            best_ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
             record["quick_best_horizon"] = best_horizon
             record["quick_hit_win_rate"] = best_hit_win_rate
             record["quick_best_raw_p_win"] = best_raw_p_win
@@ -2379,6 +2410,7 @@ def _build_market_scan_quick_incremental(
     if not qualified_records:
         return {
             "effective_trade_date": effective_trade_date or analysis_date,
+            "holding_days": selected_holding_days,
             "sample_size": total_symbols,
             "market_total_candidates": total_symbols,
             "total_candidates": scanned_records,
@@ -2391,9 +2423,11 @@ def _build_market_scan_quick_incremental(
     ranking = _rank_market_scan_quick_threshold(
         qualified_records,
         top_n=min(target_count, len(qualified_records)),
+        holding_days=selected_holding_days,
     )
     return {
         "effective_trade_date": effective_trade_date or ranking.get("effective_trade_date") or analysis_date,
+        "holding_days": selected_holding_days,
         "sample_size": total_symbols,
         "market_total_candidates": total_symbols,
         "total_candidates": scanned_records,
@@ -2415,6 +2449,7 @@ def build_market_scan_v2(
     target_date: str | None,
     risk_preference: str = "balanced",
     scan_mode: str = "market",
+    holding_days: int = 10,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     return build_market_scan_v2_final(
@@ -2422,6 +2457,7 @@ def build_market_scan_v2(
         target_date=target_date,
         risk_preference=risk_preference,
         scan_mode=scan_mode,
+        holding_days=holding_days,
         progress=progress,
     )
     if progress:

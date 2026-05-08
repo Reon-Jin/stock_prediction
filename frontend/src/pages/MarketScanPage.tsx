@@ -7,6 +7,7 @@ import type { AppShellOutletContext } from "../layouts/AppShell";
 import { useMarketScanWorkspace } from "../lib/analysisWorkspace";
 import type { MarketCandidate } from "../lib/types";
 
+const HOLDING_DAY_OPTIONS = [3, 5, 10, 20, 40] as const;
 const formatPercent = (value: number | null | undefined, digits = 1) => `${((value ?? 0) * 100).toFixed(digits)}%`;
 const formatSignedPercent = (value: number | null | undefined, digits = 2) =>
   `${(value ?? 0) >= 0 ? "+" : ""}${((value ?? 0) * 100).toFixed(digits)}%`;
@@ -139,10 +140,29 @@ export function MarketScanPage() {
                   }
                 />
               </label>
+              <label>
+                <span>持有天数</span>
+                <select
+                  value={form.holding_days}
+                  onChange={(event) =>
+                    setForm((prev) => ({
+                      ...prev,
+                      holding_days: Number(event.target.value) as typeof HOLDING_DAY_OPTIONS[number],
+                    }))
+                  }
+                  disabled={sending}
+                >
+                  {HOLDING_DAY_OPTIONS.map((days) => (
+                    <option key={days} value={days}>
+                      {days}天
+                    </option>
+                  ))}
+                </select>
+              </label>
               <div className="small-muted">
                 {form.scan_mode === "quick"
-                  ? "快速推荐会从当日可用样本里抽样预测，再为每只股票选择胜率最高的持有天数。"
-                  : "全市场推荐会对全量候选股票批量预测，再保留每只股票的最优持有天数并输出前 K 名。"}
+                  ? `快速推荐会按 ${form.holding_days} 天持有胜率筛选并排序。`
+                  : `全市场推荐会按 ${form.holding_days} 天持有胜率返回前 K 名。`}
               </div>
               <button className="primary-button" disabled={sending}>
                 {sending ? "推荐中..." : "一键推荐"}
@@ -201,6 +221,7 @@ export function MarketScanPage() {
                     </div>
                     <div className="panel-head-meta">
                       <span className="small-muted">{result.scan_mode === "quick" ? "快速推荐" : "全市场推荐"}</span>
+                      <span className="small-muted">持有 {result.holding_days || form.holding_days} 天</span>
                       <span className="small-muted">分析日期 {result.analysis_date || result.effective_trade_date}</span>
                       <span className="small-muted">样本日期 {result.effective_trade_date}</span>
                     </div>

@@ -263,6 +263,7 @@ def analyze_market_scan(
             target_date=payload.target_date,
             risk_preference=payload.risk_preference,
             scan_mode=payload.scan_mode,
+            holding_days=payload.holding_days,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -282,6 +283,7 @@ def analyze_market_scan_stream(
             top_n=payload.top_n,
             target_date=payload.target_date,
             scan_mode=payload.scan_mode,
+            holding_days=payload.holding_days,
             message=payload.message,
             refresh_analysis=payload.refresh_analysis,
         )

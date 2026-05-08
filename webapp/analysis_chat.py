@@ -661,6 +661,7 @@ def stream_market_scan_chat(
     top_n: int,
     target_date: str | None,
     scan_mode: str,
+    holding_days: int,
     message: str | None,
     refresh_analysis: bool,
 ) -> Iterator[str]:
@@ -681,6 +682,7 @@ def stream_market_scan_chat(
     if analysis and (
         int(analysis.get("top_n") or 0) != int(top_n)
         or str(analysis.get("scan_mode") or "market") != str(scan_mode or "market")
+        or int(analysis.get("holding_days") or 0) != int(holding_days)
     ):
         refresh_analysis = True
 
@@ -711,6 +713,7 @@ def stream_market_scan_chat(
                     target_date=target_date,
                     risk_preference="balanced",
                     scan_mode=scan_mode,
+                    holding_days=int(holding_days),
                     progress=progress,
                 )
                 event_queue.put(("analysis", result))

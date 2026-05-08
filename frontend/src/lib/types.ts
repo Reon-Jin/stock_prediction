@@ -174,6 +174,7 @@ export type MarketScanResult = {
   checkpoint_path: string | null;
   engine_version: string;
   scan_mode?: "market" | "quick" | string;
+  holding_days?: 3 | 5 | 10 | 20 | 40;
   sample_size?: number;
   market_total_candidates?: number;
   total_candidates: number;

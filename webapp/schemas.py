@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -83,12 +83,14 @@ class MarketScanRequest(BaseModel):
     target_date: str | None = None
     risk_preference: str = Field(default="balanced", max_length=24)
     scan_mode: str = Field(default="market", pattern="^(market|quick)$")
+    holding_days: Literal[3, 5, 10, 20, 40] = 10
 
 
 class MarketScanChatRequest(BaseModel):
     top_n: int = Field(default=12, ge=1, le=100)
     target_date: str | None = None
     scan_mode: str = Field(default="market", pattern="^(market|quick)$")
+    holding_days: Literal[3, 5, 10, 20, 40] = 10
     session_id: int | None = Field(default=None, ge=1)
     message: str | None = Field(default=None, max_length=4000)
     refresh_analysis: bool = True

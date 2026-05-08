@@ -1237,6 +1237,7 @@ def rank_market_candidates_quick(
     records: Sequence[Mapping[str, Any]],
     *,
     top_n: int = 10,
+    holding_days: int | None = None,
 ) -> dict[str, Any]:
     """
     快速推荐排序：只在 3/5/10 日窗口内选股，但会先按当前批次对各窗口做校准，
@@ -1268,7 +1269,10 @@ def rank_market_candidates_quick(
         }
     
     top_n = max(1, int(top_n))
-    horizons = (3, 5, 10)
+    allowed_horizons = (3, 5, 10, 20, 40)
+    if holding_days is not None and int(holding_days) not in allowed_horizons:
+        raise ValueError("holding_days must be one of 3, 5, 10, 20, 40")
+    horizons = (int(holding_days),) if holding_days is not None else (3, 5, 10)
     horizon_baselines: dict[int, float] = {}
     for horizon in horizons:
         probabilities = [_normalize_probability(record.get(f"p_win_prob_{horizon}")) for record in records]
@@ -1288,12 +1292,7 @@ def rank_market_candidates_quick(
             p_win = _normalize_probability(record.get(p_win_key))
             ret_mu = _safe_float(record.get(f"ret_mu_pred_{horizon}"))
             adjusted_score = p_win - horizon_baselines[horizon]
-            candidate_score = (
-                adjusted_score,
-                p_win,
-                ret_mu,
-                -horizon,
-            )
+            candidate_score = (adjusted_score, p_win, ret_mu, -horizon)
             if candidate_score > (best_adjusted_score, best_p_win, best_ret_mu, -best_horizon):
                 best_horizon = horizon
                 best_p_win = p_win
@@ -1367,6 +1366,8 @@ def rank_market_candidates_quick(
                 "S_3": _normalize_probability(record.get("p_win_prob_3")),
                 "S_5": _normalize_probability(record.get("p_win_prob_5")),
                 "S_10": _normalize_probability(record.get("p_win_prob_10")),
+                "S_20": _normalize_probability(record.get("p_win_prob_20")),
+                "S_40": _normalize_probability(record.get("p_win_prob_40")),
             },
         }
         
