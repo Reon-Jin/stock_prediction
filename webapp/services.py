@@ -1556,6 +1556,7 @@ def _simple_rank_candidates(
     top_n: int,
     risk_preference: str = "balanced",
     metadata: dict[str, Any] | None = None,
+    p_win_thresholds: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     del risk_preference
     if not records:
@@ -1569,13 +1570,20 @@ def _simple_rank_candidates(
         }
 
     horizons = tuple(int(item) for item in P_WIN_HORIZONS)
+    thresholds = p_win_thresholds or {h: 0.5 for h in horizons}
 
     def _horizon_label(days: int) -> str:
         return f"{int(days)}d"
 
     enriched: list[dict[str, Any]] = []
     for record in records:
-        best_horizon = max(horizons, key=lambda horizon: _safe_float(record.get(f"p_win_prob_{horizon}"), -1.0))
+        best_horizon = max(
+            horizons,
+            key=lambda horizon: _calibrate_probability_against_threshold(
+                _safe_float(record.get(f"p_win_prob_{horizon}"), -1.0),
+                thresholds.get(horizon, 0.5),
+            ),
+        )
         best_p_win = max(0.0, _safe_float(record.get(f"p_win_prob_{best_horizon}"), 0.0))
         signal_score = _safe_float(record.get("signal_score"))
         rank_score = _safe_float(record.get("rank_score_pred"))
@@ -1858,6 +1866,10 @@ def _build_market_scan_market_full(
         )
         for row in merged.to_dict(orient="records")
     ]
+    p_win_thresholds = {
+        horizon: float(bundle.thresholds[idx]) if idx < len(bundle.thresholds) else 0.5
+        for idx, horizon in enumerate(P_WIN_HORIZONS)
+    }
     ranking = _simple_rank_candidates(
         records,
         top_n=top_n,
@@ -1866,6 +1878,7 @@ def _build_market_scan_market_full(
             bundle,
             merged["feature_version"].iloc[0] if "feature_version" in merged.columns and not merged.empty else None,
         ),
+        p_win_thresholds=p_win_thresholds,
     )
     return {
         "effective_trade_date": effective_trade_date,
@@ -2550,6 +2563,10 @@ def build_market_scan_v2(
             )
         ranking = rank_market_candidates_quick(records, top_n=top_n)
     else:
+        p_win_thresholds = {
+            horizon: float(bundle.thresholds[idx]) if idx < len(bundle.thresholds) else 0.5
+            for idx, horizon in enumerate(P_WIN_HORIZONS)
+        }
         ranking = _simple_rank_candidates(
             records,
             top_n=top_n,
@@ -2558,6 +2575,7 @@ def build_market_scan_v2(
                 bundle,
                 merged["feature_version"].iloc[0] if "feature_version" in merged.columns and not merged.empty else None,
             ),
+            p_win_thresholds=p_win_thresholds,
         )
     
     return {
