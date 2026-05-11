@@ -15,6 +15,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.company_encoder import CompanyEncoder
 
 
+HORIZONS: tuple[int, ...] = (3, 5, 10, 20, 40)
+BIGLOSS_HORIZONS: tuple[int, ...] = (5, 20)
+DECISION_AUX_FEATURES: tuple[str, ...] = ("ret_mu", "ret_sigma", "p_win", "risk_dd", "bigloss", "upside")
+# Bigloss labels only exist for 5d and 20d; nearby horizons use the closest available risk proxy.
+BIGLOSS_PROXY_BY_HORIZON: dict[int, int] = {3: 5, 5: 5, 10: 5, 20: 20, 40: 20}
+ALIBI_INITIAL_SLOPE = 0.1
+
+
+def _inverse_softplus_scalar(value: float) -> torch.Tensor:
+    return torch.log(torch.expm1(torch.tensor(float(value))))
+
+
 class GatedResidualBlock(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -27,8 +39,9 @@ class GatedResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        gated = torch.sigmoid(self.gate(self.norm(x)))
-        hidden = self.fc1(self.norm(x))
+        norm_x = self.norm(x)
+        gated = torch.sigmoid(self.gate(norm_x))
+        hidden = self.fc1(norm_x)
         hidden = self.activation(hidden)
         hidden = self.dropout(hidden)
         hidden = self.fc2(hidden)
@@ -64,9 +77,9 @@ class DeepMLPEncoder(nn.Module):
 class TemporalConvBlock(nn.Module):
     def __init__(self, dim: int, kernel_size: int, dropout: float = 0.1) -> None:
         super().__init__()
-        padding = kernel_size // 2
+        self.left_padding = max(0, kernel_size - 1)
         self.norm = nn.LayerNorm(dim)
-        self.depthwise = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim)
+        self.depthwise = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=0, groups=dim)
         self.pointwise = nn.Conv1d(dim, dim, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.GELU()
@@ -74,6 +87,7 @@ class TemporalConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         hidden = self.norm(x).transpose(1, 2)
+        hidden = F.pad(hidden, (self.left_padding, 0))
         hidden = self.depthwise(hidden)
         hidden = self.activation(hidden)
         hidden = self.pointwise(hidden).transpose(1, 2)
@@ -84,9 +98,9 @@ class TemporalConvBlock(nn.Module):
 class TemporalMixerBlock(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 3, dropout: float = 0.1) -> None:
         super().__init__()
-        padding = kernel_size // 2
+        self.left_padding = max(0, kernel_size - 1)
         self.temporal_norm = nn.LayerNorm(dim)
-        self.depthwise = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim)
+        self.depthwise = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=0, groups=dim)
         self.channel_norm = nn.LayerNorm(dim)
         self.channel_mlp = nn.Sequential(
             nn.Linear(dim, dim * 2),
@@ -100,6 +114,7 @@ class TemporalMixerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.temporal_norm(x).transpose(1, 2)
+        hidden = F.pad(hidden, (self.left_padding, 0))
         hidden = self.depthwise(hidden).transpose(1, 2)
         x = x + self.dropout(self.activation(hidden))
         return x + self.channel_mlp(self.channel_norm(x))
@@ -132,8 +147,13 @@ class TemporalFinancialEncoder(nn.Module):
             nn.Linear(input_dim, input_dim),
             nn.Sigmoid(),
         )
+        self.input_dropout = nn.Dropout1d(dropout)
         self.input_proj = nn.Linear(input_dim, model_dim)
-        self.position_embedding = nn.Parameter(torch.zeros(1, seq_length, model_dim))
+        self.relative_age_proj = nn.Sequential(
+            nn.Linear(1, model_dim),
+            nn.Tanh(),
+        )
+        self.alibi_slope = nn.Parameter(_inverse_softplus_scalar(ALIBI_INITIAL_SLOPE))
         self.temporal_blocks = nn.ModuleList(
             [
                 TemporalMixerBlock(model_dim, kernel_size=3, dropout=dropout),
@@ -143,10 +163,10 @@ class TemporalFinancialEncoder(nn.Module):
         )
         self.gru = nn.GRU(
             input_size=model_dim,
-            hidden_size=model_dim // 2,
+            hidden_size=model_dim,
             num_layers=2,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=False,
             dropout=dropout,
         )
         self.self_attention = nn.MultiheadAttention(model_dim, num_heads=attn_heads, dropout=dropout, batch_first=True)
@@ -159,15 +179,26 @@ class TemporalFinancialEncoder(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _causal_alibi_mask(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        positions = torch.arange(seq_len, device=device)
+        distance = (positions[:, None] - positions[None, :]).clamp_min(0).to(dtype=dtype)
+        future_mask = positions[None, :] > positions[:, None]
+        slope = F.softplus(self.alibi_slope).to(dtype=dtype)
+        mask = -slope * distance
+        return mask.masked_fill(future_mask, torch.finfo(dtype).min)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_norm(x)
         x = x * self.feature_gate(x)
+        x = self.input_dropout(x.transpose(1, 2)).transpose(1, 2)
         hidden = self.input_proj(x)
-        hidden = hidden + self.position_embedding[:, : hidden.size(1)]
+        relative_age = torch.linspace(0.0, 1.0, hidden.size(1), device=hidden.device, dtype=hidden.dtype).view(1, -1, 1)
+        hidden = hidden + self.relative_age_proj(relative_age)
         for block in self.temporal_blocks:
             hidden = block(hidden)
         hidden, _ = self.gru(hidden)
-        attn_hidden, _ = self.self_attention(hidden, hidden, hidden, need_weights=False)
+        attn_mask = self._causal_alibi_mask(hidden.size(1), hidden.device, hidden.dtype)
+        attn_hidden, _ = self.self_attention(hidden, hidden, hidden, attn_mask=attn_mask, need_weights=False)
         hidden = self.attn_norm(hidden + attn_hidden)
         pooled = self.attn_pool(hidden)
         recent = hidden[:, -min(5, hidden.size(1)) :, :].mean(dim=1)
@@ -207,6 +238,203 @@ class HorizonProjector(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class ShortTermHorizonExpert(nn.Module):
+    """Expert for 3/5/10 day targets: event-sensitive, faster-changing signals."""
+
+    def __init__(self, input_dim: int, expert_dim: int, horizon: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.horizon_scale = nn.Parameter(torch.tensor(float(horizon) / 10.0))
+        self.input = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.LayerNorm(expert_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fast_path = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(expert_dim, expert_dim),
+        )
+        self.shock_gate = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.GELU(),
+            nn.Linear(expert_dim, expert_dim),
+            nn.Sigmoid(),
+        )
+        self.blocks = nn.ModuleList(
+            [GatedResidualBlock(expert_dim, expert_dim * 2, dropout=dropout) for _ in range(2)]
+        )
+        self.output = nn.Sequential(nn.LayerNorm(expert_dim), nn.Linear(expert_dim, expert_dim), nn.GELU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = self.input(x)
+        fast_signal = self.fast_path(x)
+        shock_gate = self.shock_gate(x)
+        hidden = hidden + shock_gate * fast_signal * torch.tanh(self.horizon_scale)
+        for block in self.blocks:
+            hidden = block(hidden)
+        return self.output(hidden)
+
+
+class LongTermHorizonExpert(nn.Module):
+    """Expert for 20/40 day targets: smoother trend and risk-cycle representation."""
+
+    def __init__(self, input_dim: int, expert_dim: int, horizon: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        stable_dropout = max(0.05, dropout * 0.75)
+        self.horizon_scale = nn.Parameter(torch.tensor(float(horizon) / 40.0))
+        self.trend_path = nn.Sequential(
+            nn.Linear(input_dim, expert_dim * 2),
+            nn.LayerNorm(expert_dim * 2),
+            nn.GELU(),
+            nn.Dropout(stable_dropout),
+            nn.Linear(expert_dim * 2, expert_dim),
+            nn.LayerNorm(expert_dim),
+            nn.GELU(),
+        )
+        self.cycle_path = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.LayerNorm(expert_dim),
+            nn.SiLU(),
+            nn.Dropout(stable_dropout),
+            nn.Linear(expert_dim, expert_dim),
+        )
+        self.risk_gate = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.GELU(),
+            nn.Linear(expert_dim, expert_dim),
+            nn.Sigmoid(),
+        )
+        self.blocks = nn.ModuleList(
+            [GatedResidualBlock(expert_dim, expert_dim * 2, dropout=stable_dropout) for _ in range(3)]
+        )
+        self.output = nn.Sequential(nn.LayerNorm(expert_dim), nn.Linear(expert_dim, expert_dim), nn.GELU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        trend = self.trend_path(x)
+        cycle = self.cycle_path(x)
+        hidden = trend + self.risk_gate(x) * cycle * torch.tanh(self.horizon_scale)
+        for block in self.blocks:
+            hidden = block(hidden)
+        return self.output(hidden)
+
+
+class HorizonExpertBank(nn.Module):
+    def __init__(self, input_dim: int, expert_dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.horizons = HORIZONS
+        self.experts = nn.ModuleDict(
+            {
+                str(horizon): (
+                    ShortTermHorizonExpert(input_dim, expert_dim, horizon=horizon, dropout=dropout)
+                    if horizon <= 10
+                    else LongTermHorizonExpert(input_dim, expert_dim, horizon=horizon, dropout=dropout)
+                )
+                for horizon in self.horizons
+            }
+        )
+
+    def forward(
+        self,
+        fused: torch.Tensor,
+        seq_repr: torch.Tensor,
+        context_repr: torch.Tensor,
+        tab_repr: torch.Tensor,
+        company_repr: torch.Tensor,
+        neighbor_repr: torch.Tensor,
+    ) -> dict[int, torch.Tensor]:
+        expert_input = torch.cat([fused, seq_repr, context_repr, tab_repr, company_repr, neighbor_repr], dim=-1)
+        return {horizon: self.experts[str(horizon)](expert_input) for horizon in self.horizons}
+
+
+class HorizonMoEHead(nn.Module):
+    def __init__(
+        self,
+        expert_dim: int,
+        output_horizons: tuple[int, ...],
+        hidden_dim: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.output_horizons = tuple(output_horizons)
+        self.heads = nn.ModuleDict(
+            {
+                str(horizon): nn.Sequential(
+                    nn.Linear(expert_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, 1),
+                )
+                for horizon in self.output_horizons
+            }
+        )
+
+    def forward(self, expert_reprs: dict[int, torch.Tensor]) -> torch.Tensor:
+        return torch.cat([self.heads[str(horizon)](expert_reprs[horizon]) for horizon in self.output_horizons], dim=-1)
+
+
+class HorizonDecisionHead(nn.Module):
+    def __init__(
+        self,
+        expert_dim: int,
+        output_horizons: tuple[int, ...],
+        hidden_dim: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.output_horizons = tuple(output_horizons)
+        self.aux_feature_count = len(DECISION_AUX_FEATURES)
+        self.heads = nn.ModuleDict(
+            {
+                str(horizon): nn.Sequential(
+                    nn.Linear(expert_dim + self.aux_feature_count, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, 1),
+                )
+                for horizon in self.output_horizons
+            }
+        )
+
+    @staticmethod
+    def _column_or_zeros(
+        values: torch.Tensor | None,
+        column_idx: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if values is None or values.numel() == 0 or column_idx >= values.size(1):
+            return torch.zeros(batch_size, 1, dtype=dtype, device=device)
+        return values[:, column_idx : column_idx + 1]
+
+    def forward(
+        self,
+        expert_reprs: dict[int, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
+        bigloss_by_horizon: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch_size = next(iter(expert_reprs.values())).size(0)
+        device = next(iter(expert_reprs.values())).device
+        dtype = next(iter(expert_reprs.values())).dtype
+        columns: list[torch.Tensor] = []
+        for column_idx, horizon in enumerate(self.output_horizons):
+            features = [
+                expert_reprs[horizon],
+                self._column_or_zeros(outputs.get("ret_mu"), column_idx, batch_size, device, dtype),
+                self._column_or_zeros(outputs.get("ret_sigma"), column_idx, batch_size, device, dtype),
+                torch.sigmoid(self._column_or_zeros(outputs.get("p_win"), column_idx, batch_size, device, dtype)),
+                self._column_or_zeros(outputs.get("risk_dd"), column_idx, batch_size, device, dtype),
+                self._column_or_zeros(bigloss_by_horizon, column_idx, batch_size, device, dtype),
+                self._column_or_zeros(outputs.get("upside"), column_idx, batch_size, device, dtype),
+            ]
+            columns.append(self.heads[str(horizon)](torch.cat(features, dim=-1)))
+        return torch.cat(columns, dim=-1)
 
 
 class EventEncoderWithGate(nn.Module):
@@ -288,6 +516,7 @@ class ProfessionalFinancialModel(nn.Module):
         company_dim: int = 48,
         fusion_dim: int = 256,
         task_hidden_dim: int = 128,
+        horizon_expert_dim: int = 128,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
@@ -349,43 +578,70 @@ class ProfessionalFinancialModel(nn.Module):
             nn.Linear(fusion_dim, fusion_dim),
             nn.GELU(),
         )
-        self.heads = nn.ModuleDict(
-            {
-                head_name: nn.Sequential(
+        horizon_expert_input_dim = fusion_dim + seq_output_dim + context_dim + 64 + company_dim + company_dim
+        self.horizon_experts = HorizonExpertBank(
+            input_dim=horizon_expert_input_dim,
+            expert_dim=horizon_expert_dim,
+            dropout=dropout,
+        )
+        self.horizon_heads = nn.ModuleDict()
+        self.shared_heads = nn.ModuleDict()
+        self.head_horizons: dict[str, tuple[int, ...]] = {}
+        for head_name, head_dim in head_dims.items():
+            output_horizons = self._resolve_output_horizons(head_name, int(head_dim))
+            if output_horizons:
+                self.horizon_heads[head_name] = HorizonMoEHead(
+                    expert_dim=horizon_expert_dim,
+                    output_horizons=output_horizons,
+                    hidden_dim=task_hidden_dim,
+                    dropout=dropout,
+                )
+                self.head_horizons[head_name] = output_horizons
+            else:
+                self.shared_heads[head_name] = nn.Sequential(
                     nn.Linear(fusion_dim, task_hidden_dim),
                     nn.LayerNorm(task_hidden_dim),
                     nn.GELU(),
                     nn.Dropout(dropout),
                     nn.Linear(task_hidden_dim, int(head_dim)),
                 )
-                for head_name, head_dim in head_dims.items()
-            }
-        )
         p_win_dim = int(head_dims.get("p_win", 0))
         ret_mu_dim = int(head_dims.get("ret_mu", p_win_dim))
-        risk_dd_dim = int(head_dims.get("risk_dd", p_win_dim))
-        bigloss_dim = int(head_dims.get("bigloss", 0))
-        self.ret_sigma_head = nn.Sequential(
-            nn.Linear(fusion_dim, task_hidden_dim),
-            nn.LayerNorm(task_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(task_hidden_dim, ret_mu_dim),
-        )
-        self.upside_head = nn.Sequential(
-            nn.Linear(fusion_dim, task_hidden_dim),
-            nn.LayerNorm(task_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(task_hidden_dim, ret_mu_dim),
-        )
-        decision_feature_dim = fusion_dim + ret_mu_dim + ret_mu_dim + p_win_dim + risk_dd_dim + bigloss_dim + ret_mu_dim
-        self.decision_score_head = nn.Sequential(
-            nn.Linear(decision_feature_dim, task_hidden_dim),
-            nn.LayerNorm(task_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(task_hidden_dim, max(1, p_win_dim)),
+        ret_sigma_horizons = self._resolve_output_horizons("ret_mu", ret_mu_dim)
+        if ret_sigma_horizons:
+            self.ret_sigma_head: nn.Module = HorizonMoEHead(
+                expert_dim=horizon_expert_dim,
+                output_horizons=ret_sigma_horizons,
+                hidden_dim=task_hidden_dim,
+                dropout=dropout,
+            )
+            self.upside_head: nn.Module = HorizonMoEHead(
+                expert_dim=horizon_expert_dim,
+                output_horizons=ret_sigma_horizons,
+                hidden_dim=task_hidden_dim,
+                dropout=dropout,
+            )
+        else:
+            self.ret_sigma_head = nn.Sequential(
+                nn.Linear(fusion_dim, task_hidden_dim),
+                nn.LayerNorm(task_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(task_hidden_dim, ret_mu_dim),
+            )
+            self.upside_head = nn.Sequential(
+                nn.Linear(fusion_dim, task_hidden_dim),
+                nn.LayerNorm(task_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(task_hidden_dim, ret_mu_dim),
+            )
+        decision_horizons = self._resolve_output_horizons("p_win", p_win_dim)
+        self.decision_score_head: nn.Module = HorizonDecisionHead(
+            expert_dim=horizon_expert_dim,
+            output_horizons=decision_horizons or HORIZONS[: max(1, p_win_dim)],
+            hidden_dim=task_hidden_dim,
+            dropout=dropout,
         )
         self.p_win_regime_head: nn.Module | None = None
         if p_win_dim > 0:
@@ -396,6 +652,38 @@ class ProfessionalFinancialModel(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(task_hidden_dim, p_win_dim),
             )
+
+    @staticmethod
+    def _resolve_output_horizons(head_name: str, head_dim: int) -> tuple[int, ...]:
+        if head_dim <= 0:
+            return ()
+        if head_dim == len(HORIZONS):
+            return HORIZONS
+        if head_name == "bigloss" and head_dim == len(BIGLOSS_HORIZONS):
+            return BIGLOSS_HORIZONS
+        return ()
+
+    @staticmethod
+    def _expand_bigloss_to_horizons(
+        bigloss_logits: torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if bigloss_logits is None or bigloss_logits.numel() == 0:
+            return None
+        bigloss_prob = torch.sigmoid(bigloss_logits)
+        if bigloss_prob.size(1) == len(HORIZONS):
+            return bigloss_prob
+        if bigloss_prob.size(1) == len(BIGLOSS_HORIZONS):
+            expanded = torch.zeros(batch_size, len(HORIZONS), dtype=bigloss_prob.dtype, device=device)
+            source_column_by_horizon = {
+                source_horizon: column_idx for column_idx, source_horizon in enumerate(BIGLOSS_HORIZONS)
+            }
+            for target_column, horizon in enumerate(HORIZONS):
+                source_horizon = BIGLOSS_PROXY_BY_HORIZON[horizon]
+                expanded[:, target_column] = bigloss_prob[:, source_column_by_horizon[source_horizon]]
+            return expanded
+        return bigloss_prob
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         seq_repr = self.temporal_encoder(batch["X_seq"].float())
@@ -425,22 +713,33 @@ class ProfessionalFinancialModel(nn.Module):
         for block in self.fusion_blocks:
             fused = block(fused)
         fused = self.shared_out(fused)
-        outputs = {head_name: head(fused) for head_name, head in self.heads.items()}
+        expert_reprs = self.horizon_experts(
+            fused=fused,
+            seq_repr=seq_repr,
+            context_repr=context_repr,
+            tab_repr=tab_repr,
+            company_repr=company_repr,
+            neighbor_repr=neighbor_repr,
+        )
+        outputs = {head_name: head(fused) for head_name, head in self.shared_heads.items()}
+        outputs.update({head_name: head(expert_reprs) for head_name, head in self.horizon_heads.items()})
         outputs["event_strength"] = event_strength
-        outputs["ret_sigma"] = F.softplus(self.ret_sigma_head(fused)) + 1e-4
-        outputs["upside"] = F.softplus(self.upside_head(fused))
+        ret_sigma_raw = (
+            self.ret_sigma_head(expert_reprs)
+            if isinstance(self.ret_sigma_head, HorizonMoEHead)
+            else self.ret_sigma_head(fused)
+        )
+        upside_raw = (
+            self.upside_head(expert_reprs)
+            if isinstance(self.upside_head, HorizonMoEHead)
+            else self.upside_head(fused)
+        )
+        outputs["ret_sigma"] = F.softplus(ret_sigma_raw) + 1e-4
+        outputs["upside"] = F.softplus(upside_raw)
         if "bigloss" in outputs:
             outputs["bigloss_prob"] = torch.sigmoid(outputs["bigloss"])
-        decision_features = [
-            fused,
-            outputs.get("ret_mu", fused.new_zeros(fused.size(0), 0)),
-            outputs["ret_sigma"],
-            torch.sigmoid(outputs["p_win"]) if "p_win" in outputs else fused.new_zeros(fused.size(0), 0),
-            outputs.get("risk_dd", fused.new_zeros(fused.size(0), 0)),
-            torch.sigmoid(outputs["bigloss"]) if "bigloss" in outputs else fused.new_zeros(fused.size(0), 0),
-            outputs["upside"],
-        ]
-        outputs["decision_score"] = self.decision_score_head(torch.cat(decision_features, dim=-1))
+        bigloss_by_horizon = self._expand_bigloss_to_horizons(outputs.get("bigloss"), fused.size(0), fused.device)
+        outputs["decision_score"] = self.decision_score_head(expert_reprs, outputs, bigloss_by_horizon)
         if self.p_win_regime_head is not None and "p_win" in outputs:
             regime_logits = self.p_win_regime_head(context_repr)
             outputs["p_win_base"] = outputs["p_win"]

@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from train.data import DataBundle, build_data_bundle, load_split_for_evaluation
-from train.model import TinyMultiInputModel
+from train.model import BIGLOSS_HORIZONS, BIGLOSS_PROXY_BY_HORIZON, HORIZONS, TinyMultiInputModel
 from train.visualization import plot_business_history, plot_topk_metrics, plot_training_history
 
 DEFAULT_P_WIN_HORIZONS = (3, 5, 10, 20, 40)
@@ -77,6 +77,8 @@ class TrainConfig:
     warmup_epochs: int
     min_lr_ratio: float
     ema_decay: float
+    use_amp: bool
+    focal_gamma: float
     use_weighted_sampler: bool
     sampler_recency_power: float
     sampler_positive_balance_power: float
@@ -134,12 +136,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--test-path", type=str, default="data/exports/test.parquet")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="train/cache")
-    parser.add_argument("--seq-length", type=int, default=20)
+    parser.add_argument("--seq-length", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--seq-model-dim", type=int, default=96)
     parser.add_argument("--seq-output-dim", type=int, default=128)
     parser.add_argument("--seq-attn-heads", type=int, default=4)
@@ -149,7 +151,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--fusion-dim", type=int, default=256)
     parser.add_argument("--task-hidden-dim", type=int, default=128)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--early-stop-patience", type=int, default=4)
+    parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--rebuild-cache", action="store_true")
@@ -157,23 +159,25 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--label-smoothing", type=float, default=0.02)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--min-lr-ratio", type=float, default=0.15)
-    parser.add_argument("--ema-decay", type=float, default=0.997)
+    parser.add_argument("--ema-decay", type=float, default=0.995)
+    parser.add_argument("--use-amp", action="store_true", help="Enable CUDA autocast; float32 is the default.")
+    parser.add_argument("--focal-gamma", type=float, default=0.75)
     parser.add_argument("--disable-weighted-sampler", action="store_true")
     parser.add_argument("--sampler-recency-power", type=float, default=1.5)
     parser.add_argument("--sampler-positive-balance-power", type=float, default=0.5)
     parser.add_argument("--sampler-balance-horizon-index", type=int, default=1)
     parser.add_argument("--p-win-weight", type=float, default=0.9)
     parser.add_argument("--ret-mu-weight", type=float, default=1.0)
-    parser.add_argument("--ret-sigma-weight", type=float, default=0.15)
-    parser.add_argument("--risk-dd-weight", type=float, default=1.1)
-    parser.add_argument("--bigloss-weight", type=float, default=1.2)
-    parser.add_argument("--upside-weight", type=float, default=0.6)
+    parser.add_argument("--ret-sigma-weight", type=float, default=0.0)
+    parser.add_argument("--risk-dd-weight", type=float, default=0.0)
+    parser.add_argument("--bigloss-weight", type=float, default=0.0)
+    parser.add_argument("--upside-weight", type=float, default=0.0)
     parser.add_argument("--rank-pairwise-weight", type=float, default=1.0)
-    parser.add_argument("--rank-score-weight", type=float, default=0.15)
-    parser.add_argument("--bigloss-margin-weight", type=float, default=0.6)
-    parser.add_argument("--anti-conservative-weight", type=float, default=0.5)
-    parser.add_argument("--calibration-weight", type=float, default=0.15)
-    parser.add_argument("--p-win-regime-weight", type=float, default=0.2)
+    parser.add_argument("--rank-score-weight", type=float, default=0.0)
+    parser.add_argument("--bigloss-margin-weight", type=float, default=0.0)
+    parser.add_argument("--anti-conservative-weight", type=float, default=0.0)
+    parser.add_argument("--calibration-weight", type=float, default=0.0)
+    parser.add_argument("--p-win-regime-weight", type=float, default=0.0)
     parser.add_argument("--p-win-negative-weight", type=float, default=1.18)
     parser.add_argument("--p-win-downside-weight", type=float, default=0.75)
     parser.add_argument("--primary-horizon-index", type=int, default=2, help="0-based main horizon; default 2 means 10d.")
@@ -222,6 +226,8 @@ def parse_args() -> TrainConfig:
         warmup_epochs=args.warmup_epochs,
         min_lr_ratio=args.min_lr_ratio,
         ema_decay=args.ema_decay,
+        use_amp=args.use_amp,
+        focal_gamma=args.focal_gamma,
         use_weighted_sampler=not args.disable_weighted_sampler,
         sampler_recency_power=args.sampler_recency_power,
         sampler_positive_balance_power=args.sampler_positive_balance_power,
@@ -261,6 +267,14 @@ def configure_runtime(device: str) -> None:
     torch.set_float32_matmul_precision("high")
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
+
+
+def autocast_config(device: torch.device, config: TrainConfig) -> tuple[bool, torch.dtype]:
+    enabled = bool(config.use_amp and device.type == "cuda")
+    if not enabled:
+        return False, torch.float32
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return True, dtype
 
 
 def ensure_dir(path: Path) -> Path:
@@ -404,16 +418,16 @@ def _expand_bigloss_targets(bigloss_targets: torch.Tensor, target_dim: int) -> t
     if bigloss_targets.size(1) == target_dim:
         return bigloss_targets
     expanded = torch.zeros((bigloss_targets.size(0), target_dim), dtype=bigloss_targets.dtype, device=bigloss_targets.device)
-    if bigloss_targets.size(1) >= 1 and target_dim >= 1:
-        expanded[:, 0] = bigloss_targets[:, 0]
-    if bigloss_targets.size(1) >= 1 and target_dim >= 2:
-        expanded[:, 1] = bigloss_targets[:, 0]
-    if bigloss_targets.size(1) >= 1 and target_dim >= 3:
-        expanded[:, 2] = bigloss_targets[:, 0]
-    if bigloss_targets.size(1) >= 2 and target_dim >= 4:
-        expanded[:, 3] = bigloss_targets[:, 1]
-    if bigloss_targets.size(1) >= 2 and target_dim >= 5:
-        expanded[:, 4] = bigloss_targets[:, 1]
+    if bigloss_targets.size(1) == len(BIGLOSS_HORIZONS) and target_dim <= len(HORIZONS):
+        source_column_by_horizon = {
+            source_horizon: column_idx for column_idx, source_horizon in enumerate(BIGLOSS_HORIZONS)
+        }
+        for target_column, horizon in enumerate(HORIZONS[:target_dim]):
+            source_horizon = BIGLOSS_PROXY_BY_HORIZON[horizon]
+            expanded[:, target_column] = bigloss_targets[:, source_column_by_horizon[source_horizon]]
+        return expanded
+    copy_dim = min(bigloss_targets.size(1), target_dim)
+    expanded[:, :copy_dim] = bigloss_targets[:, :copy_dim]
     return expanded
 
 
@@ -450,7 +464,7 @@ def _focal_bce_with_logits(
     logits: torch.Tensor,
     targets: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
-    gamma: float = 1.5,
+    gamma: float = 0.75,
 ) -> torch.Tensor:
     bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction="none")
     prob = torch.sigmoid(logits)
@@ -465,7 +479,8 @@ def _pairwise_rank_loss(
     date_idx: torch.Tensor | None,
     horizon_idx: int,
     min_return_gap: float = 0.003,
-    max_pairs_per_date: int = 4096,
+    max_pairs_per_date: int = 65536,
+    max_matrix_items: int = 2048,
 ) -> torch.Tensor:
     if date_idx is None or decision_scores.numel() == 0 or returns.numel() == 0:
         return decision_scores.new_tensor(0.0)
@@ -475,28 +490,33 @@ def _pairwise_rank_loss(
         score = decision_scores.reshape(-1)
     ret = returns[:, _primary_index_for_width(horizon_idx, returns.size(1))] if returns.ndim == 2 else returns.reshape(-1)
     dates = date_idx.reshape(-1).long()
-    losses: list[torch.Tensor] = []
-    for date in torch.unique(dates):
-        mask = dates == date
-        if int(mask.sum().item()) < 2:
-            continue
-        date_score = score[mask]
-        date_ret = ret[mask]
-        ret_gap = date_ret.unsqueeze(1) - date_ret.unsqueeze(0)
-        pair_mask = ret_gap > float(min_return_gap)
-        if not pair_mask.any():
-            continue
-        score_gap = date_score.unsqueeze(1) - date_score.unsqueeze(0)
-        pair_losses = F.softplus(-score_gap[pair_mask])
-        pair_weights = ret_gap[pair_mask].abs().clamp_min(float(min_return_gap))
-        if pair_losses.numel() > max_pairs_per_date:
-            selection = torch.randperm(pair_losses.numel(), device=pair_losses.device)[:max_pairs_per_date]
-            pair_losses = pair_losses[selection]
-            pair_weights = pair_weights[selection]
-        losses.append((pair_losses * pair_weights).mean())
-    if not losses:
+
+    valid = torch.isfinite(score) & torch.isfinite(ret)
+    score = score[valid]
+    ret = ret[valid]
+    dates = dates[valid]
+    if score.numel() < 2:
         return decision_scores.new_tensor(0.0)
-    return torch.stack(losses).mean()
+    if score.numel() > max_matrix_items:
+        selection = torch.randperm(score.numel(), device=score.device)[:max_matrix_items]
+        score = score[selection]
+        ret = ret[selection]
+        dates = dates[selection]
+
+    same_date = dates[:, None].eq(dates[None, :])
+    ret_gap = ret[:, None] - ret[None, :]
+    pair_mask = same_date & (ret_gap > float(min_return_gap))
+    if not pair_mask.any():
+        return decision_scores.new_tensor(0.0)
+
+    score_gap = score[:, None] - score[None, :]
+    pair_losses = F.softplus(-score_gap[pair_mask])
+    pair_weights = ret_gap[pair_mask].clamp_min(float(min_return_gap))
+    if pair_losses.numel() > max_pairs_per_date:
+        selection = torch.randperm(pair_losses.numel(), device=pair_losses.device)[:max_pairs_per_date]
+        pair_losses = pair_losses[selection]
+        pair_weights = pair_weights[selection]
+    return (pair_losses * pair_weights).mean()
 
 
 def _global_pairwise_rank_loss(
@@ -546,6 +566,7 @@ def compute_losses(
         outputs["p_win"],
         p_win_targets,
         pos_weight=loss_context.p_win_pos_weight,
+        gamma=config.focal_gamma,
     )
     p_win_sample_weight = _downside_weight_matrix(targets, config, p_win_head_dim)
     loss_p_win = (
@@ -556,29 +577,32 @@ def compute_losses(
     loss_ret_mu = F.smooth_l1_loss(outputs["ret_mu"], targets["ret_mu"], reduction="none")
     loss_ret_mu = (loss_ret_mu * loss_context.ret_mu_horizon_weight.unsqueeze(0)).mean()
     loss_ret_sigma = outputs["p_win"].new_tensor(0.0)
-    if "ret_sigma" in outputs:
+    if config.ret_sigma_weight > 0 and "ret_sigma" in outputs:
         abs_error_target = torch.abs(outputs["ret_mu"].detach() - targets["ret_mu"])
         loss_ret_sigma = F.smooth_l1_loss(outputs["ret_sigma"], abs_error_target)
-    loss_risk_dd = F.smooth_l1_loss(outputs["risk_dd"], targets["risk_dd"], reduction="none")
-    deep_dd_weight = 1.0 + 2.0 * (targets["risk_dd"].float() < -0.05).float()
-    loss_risk_dd = loss_risk_dd * deep_dd_weight
-    loss_risk_dd = (loss_risk_dd * loss_context.risk_dd_horizon_weight.unsqueeze(0)).mean()
+    loss_risk_dd = outputs["p_win"].new_tensor(0.0)
+    if config.risk_dd_weight > 0 and "risk_dd" in outputs and "risk_dd" in targets:
+        loss_risk_dd = F.smooth_l1_loss(outputs["risk_dd"], targets["risk_dd"], reduction="none")
+        deep_dd_weight = 1.0 + 2.0 * (targets["risk_dd"].float() < -0.05).float()
+        loss_risk_dd = loss_risk_dd * deep_dd_weight
+        loss_risk_dd = (loss_risk_dd * loss_context.risk_dd_horizon_weight.unsqueeze(0)).mean()
     loss_bigloss = outputs["p_win"].new_tensor(0.0)
-    if "bigloss" in outputs and "bigloss" in targets and targets["bigloss"].numel() > 0:
+    if config.bigloss_weight > 0 and "bigloss" in outputs and "bigloss" in targets and targets["bigloss"].numel() > 0:
         bigloss_targets = targets["bigloss"].float()
         loss_bigloss = _focal_bce_with_logits(
             outputs["bigloss"],
             bigloss_targets,
+            gamma=config.focal_gamma,
         )
         severity_weight = 1.0 + 2.0 * bigloss_targets
         loss_bigloss = (loss_bigloss * severity_weight).mean()
     loss_upside = outputs["p_win"].new_tensor(0.0)
-    if "upside" in outputs:
+    if config.upside_weight > 0 and "upside" in outputs:
         upside_targets = torch.relu(targets["ret_mu"].float())
         strong_up_weight = 1.0 + 2.0 * (upside_targets > 0.03).float()
         loss_upside = (F.smooth_l1_loss(outputs["upside"], upside_targets, reduction="none") * strong_up_weight).mean()
     loss_rank_score = outputs["p_win"].new_tensor(0.0)
-    if "rank_score" in outputs and "rank_score" in targets:
+    if config.rank_score_weight > 0 and "rank_score" in outputs and "rank_score" in targets:
         rank_score_pred = torch.sigmoid(outputs["rank_score"])
         loss_rank_score = F.smooth_l1_loss(rank_score_pred, targets["rank_score"])
     date_idx = None
@@ -591,30 +615,40 @@ def compute_losses(
             date_idx,
             horizon_idx=horizon_idx,
         )
-        if decision_scores is not None
+        if config.rank_pairwise_weight > 0 and decision_scores is not None
         else outputs["p_win"].new_tensor(0.0)
     )
     if (
-        decision_scores is not None
+        config.rank_pairwise_weight > 0
+        and decision_scores is not None
         and "rank_score" in targets
         and float(loss_rank_pairwise.detach().abs().item()) < 1e-12
     ):
         loss_rank_pairwise = _global_pairwise_rank_loss(decision_scores, targets["rank_score"], horizon_idx)
     loss_bigloss_margin = outputs["p_win"].new_tensor(0.0)
-    if decision_scores is not None and "bigloss" in targets and targets["bigloss"].numel() > 0:
+    if (
+        config.bigloss_margin_weight > 0
+        and decision_scores is not None
+        and "bigloss" in targets
+        and targets["bigloss"].numel() > 0
+    ):
         expanded_bigloss = _expand_bigloss_targets(targets["bigloss"].float(), decision_scores.size(1))
         decision_primary = decision_scores[:, _primary_index_for_width(horizon_idx, decision_scores.size(1))]
         bigloss_primary = expanded_bigloss[:, _primary_index_for_width(horizon_idx, expanded_bigloss.size(1))]
         if bool((bigloss_primary > 0.5).any().item()):
             loss_bigloss_margin = F.relu(decision_primary[bigloss_primary > 0.5]).mean()
     loss_anti_conservative = outputs["p_win"].new_tensor(0.0)
-    if decision_scores is not None:
+    if config.anti_conservative_weight > 0 and decision_scores is not None:
         decision_primary = decision_scores[:, _primary_index_for_width(horizon_idx, decision_scores.size(1))]
         ret_primary = targets["ret_mu"][:, _primary_index_for_width(horizon_idx, targets["ret_mu"].size(1))]
         strong_up = ret_primary > 0.03
         if bool(strong_up.any().item()):
             loss_anti_conservative = F.relu(0.2 - decision_primary[strong_up]).mean()
-    loss_calibration = torch.abs(torch.sigmoid(outputs["p_win"]).mean(dim=0) - targets["p_win"].float().mean(dim=0)).mean()
+    loss_calibration = outputs["p_win"].new_tensor(0.0)
+    if config.calibration_weight > 0:
+        loss_calibration = torch.abs(
+            torch.sigmoid(outputs["p_win"]).mean(dim=0) - targets["p_win"].float().mean(dim=0)
+        ).mean()
     loss_p_win_regime = outputs["p_win"].new_tensor(0.0)
     if (
         aux_targets
@@ -1060,7 +1094,7 @@ def train_one_epoch(
         primary_horizon_index=config.primary_horizon_index,
     )
     progress = tqdm(loader, desc=f"Epoch {epoch} [train]", leave=False, disable=config.disable_tqdm)
-    autocast_enabled = device.type == "cuda"
+    autocast_enabled, autocast_dtype = autocast_config(device, config)
     p_win_thresholds = resolve_p_win_thresholds(device, loss_context.p_win_pos_weight.numel())
 
     for step, batch in enumerate(progress, start=1):
@@ -1068,7 +1102,7 @@ def train_one_epoch(
             break
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=autocast_enabled):
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled):
             outputs = model(batch)
             loss, parts = compute_losses(outputs, batch["y"], config, loss_context, aux_targets=batch.get("aux"))
         scaler.scale(loss).backward()
@@ -1113,14 +1147,14 @@ def evaluate(
         primary_horizon_index=config.primary_horizon_index,
     )
     progress = tqdm(loader, desc=desc, leave=False, disable=config.disable_tqdm)
-    autocast_enabled = device.type == "cuda"
+    autocast_enabled, autocast_dtype = autocast_config(device, config)
     resolved_thresholds = resolve_p_win_thresholds(device, loss_context.p_win_pos_weight.numel(), p_win_thresholds)
 
     for step, batch in enumerate(progress, start=1):
         if config.max_eval_batches is not None and step > config.max_eval_batches:
             break
         batch = move_batch_to_device(batch, device)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=autocast_enabled):
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled):
             outputs = model(batch)
             loss, parts = compute_losses(outputs, batch["y"], config, loss_context, aux_targets=batch.get("aux"))
 
@@ -1184,12 +1218,12 @@ def collect_p_win_predictions(
     model.eval()
     probs: list[torch.Tensor] = []
     targets: list[torch.Tensor] = []
-    autocast_enabled = device.type == "cuda"
+    autocast_enabled, autocast_dtype = autocast_config(device, config)
     for step, batch in enumerate(loader, start=1):
         if config.max_eval_batches is not None and step > config.max_eval_batches:
             break
         batch = move_batch_to_device(batch, device)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=autocast_enabled):
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled):
             outputs = model(batch)
         probs.append(torch.sigmoid(outputs["p_win"].detach()).cpu())
         targets.append(batch["y"]["p_win"].detach().cpu())
@@ -1286,7 +1320,7 @@ def main() -> None:
     model = build_model(bundle, config, device)
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = build_scheduler(optimizer, config)
-    scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler(device.type, enabled=bool(config.use_amp and device.type == "cuda"))
     ema = ModelEMA(model, config.ema_decay) if 0.0 < config.ema_decay < 1.0 else None
 
     history: list[dict[str, float]] = []
