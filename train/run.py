@@ -32,6 +32,8 @@ from train.visualization import plot_business_history, plot_topk_metrics, plot_t
 DEFAULT_P_WIN_HORIZONS = (3, 5, 10, 20, 40)
 LOSS_PART_NAMES = (
     "loss_p_win",
+    "loss_p_win_brier",
+    "loss_p_win_logit_l2",
     "loss_ret_mu",
     "loss_ret_sigma",
     "loss_risk_dd",
@@ -79,6 +81,10 @@ class TrainConfig:
     ema_decay: float
     use_amp: bool
     focal_gamma: float
+    p_win_brier_weight: float
+    p_win_logit_l2_weight: float
+    decision_detach_aux: bool
+    diagnostic_eval_batches: int
     use_weighted_sampler: bool
     sampler_recency_power: float
     sampler_positive_balance_power: float
@@ -159,9 +165,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--label-smoothing", type=float, default=0.02)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--min-lr-ratio", type=float, default=0.15)
-    parser.add_argument("--ema-decay", type=float, default=0.995)
+    parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--use-amp", action="store_true", help="Enable CUDA autocast; float32 is the default.")
-    parser.add_argument("--focal-gamma", type=float, default=0.75)
+    parser.add_argument("--focal-gamma", type=float, default=0.25)
+    parser.add_argument("--p-win-brier-weight", type=float, default=0.05)
+    parser.add_argument("--p-win-logit-l2-weight", type=float, default=1e-4)
+    parser.add_argument("--no-decision-detach-aux", action="store_true")
+    parser.add_argument("--diagnostic-eval-batches", type=int, default=2)
     parser.add_argument("--disable-weighted-sampler", action="store_true")
     parser.add_argument("--sampler-recency-power", type=float, default=1.5)
     parser.add_argument("--sampler-positive-balance-power", type=float, default=0.5)
@@ -228,6 +238,10 @@ def parse_args() -> TrainConfig:
         ema_decay=args.ema_decay,
         use_amp=args.use_amp,
         focal_gamma=args.focal_gamma,
+        p_win_brier_weight=args.p_win_brier_weight,
+        p_win_logit_l2_weight=args.p_win_logit_l2_weight,
+        decision_detach_aux=not args.no_decision_detach_aux,
+        diagnostic_eval_batches=args.diagnostic_eval_batches,
         use_weighted_sampler=not args.disable_weighted_sampler,
         sampler_recency_power=args.sampler_recency_power,
         sampler_positive_balance_power=args.sampler_positive_balance_power,
@@ -338,6 +352,7 @@ def build_model_kwargs(config: TrainConfig) -> dict[str, Any]:
         "fusion_dim": config.fusion_dim,
         "task_hidden_dim": config.task_hidden_dim,
         "decision_aux_features": decision_aux_features_from_config(config),
+        "decision_detach_aux": config.decision_detach_aux,
         "dropout": config.dropout,
     }
 
@@ -350,7 +365,7 @@ def build_loss_context(bundle: DataBundle, device: torch.device) -> LossContext:
 
     num_h = int(p_win.shape[1])
     if num_h == 5:
-        p_win_hw = torch.tensor([0.8, 1.0, 1.2, 1.1, 0.9], dtype=torch.float32, device=device)
+        p_win_hw = torch.tensor([1.0, 1.0, 1.2, 0.7, 0.3], dtype=torch.float32, device=device)
         ret_mu_hw = torch.tensor([0.6, 1.0, 1.2, 1.1, 0.8], dtype=torch.float32, device=device)
         risk_dd_hw = torch.tensor([0.7, 1.0, 1.2, 1.2, 0.9], dtype=torch.float32, device=device)
     else:
@@ -532,6 +547,68 @@ def _pairwise_rank_loss(
     return (pair_losses * pair_weights).mean()
 
 
+def _risk_adjusted_utility_targets(targets: dict[str, torch.Tensor], target_dim: int) -> torch.Tensor:
+    ret = targets["ret_mu"].float()
+    width = min(target_dim, ret.size(1)) if ret.ndim == 2 else target_dim
+    ret = ret[:, :width] if ret.ndim == 2 else ret.reshape(-1, 1)
+    device = ret.device
+    dtype = ret.dtype
+
+    risk_dd = targets.get("risk_dd")
+    drawdown = torch.zeros_like(ret)
+    if risk_dd is not None and risk_dd.numel() > 0:
+        risk_values = risk_dd.float()
+        risk_values = risk_values[:, :width] if risk_values.ndim == 2 else risk_values.reshape(-1, 1)
+        drawdown = torch.relu(-risk_values)
+
+    bigloss = torch.zeros_like(ret)
+    if "bigloss" in targets and targets["bigloss"].numel() > 0:
+        bigloss = _expand_bigloss_targets(targets["bigloss"].float(), width)
+
+    if width == len(HORIZONS):
+        drawdown_weight = torch.tensor([0.6, 0.6, 0.6, 0.8, 0.8], dtype=dtype, device=device)
+        bigloss_weight = torch.tensor([0.8, 0.8, 0.8, 0.6, 0.6], dtype=dtype, device=device)
+        upside_weight = torch.tensor([0.2, 0.2, 0.2, 0.3, 0.3], dtype=dtype, device=device)
+    else:
+        drawdown_weight = torch.full((width,), 0.7, dtype=dtype, device=device)
+        bigloss_weight = torch.full((width,), 0.7, dtype=dtype, device=device)
+        upside_weight = torch.full((width,), 0.2, dtype=dtype, device=device)
+
+    upside = torch.relu(ret)
+    return ret - drawdown_weight.unsqueeze(0) * drawdown - bigloss_weight.unsqueeze(0) * bigloss + upside_weight.unsqueeze(0) * upside
+
+
+def _multi_horizon_pairwise_rank_loss(
+    decision_scores: torch.Tensor,
+    utility_targets: torch.Tensor,
+    date_idx: torch.Tensor | None,
+) -> torch.Tensor:
+    if date_idx is None or decision_scores.numel() == 0 or utility_targets.numel() == 0:
+        return decision_scores.new_tensor(0.0)
+    width = min(decision_scores.size(1), utility_targets.size(1))
+    if width <= 0:
+        return decision_scores.new_tensor(0.0)
+    if width == len(HORIZONS):
+        horizon_weights = torch.tensor([1.0, 1.0, 1.2, 0.7, 0.3], dtype=decision_scores.dtype, device=decision_scores.device)
+    else:
+        horizon_weights = torch.ones(width, dtype=decision_scores.dtype, device=decision_scores.device)
+
+    losses = []
+    weights = []
+    for horizon_idx in range(width):
+        loss = _pairwise_rank_loss(
+            decision_scores[:, horizon_idx : horizon_idx + 1],
+            utility_targets[:, horizon_idx : horizon_idx + 1],
+            date_idx,
+            horizon_idx=0,
+        )
+        losses.append(loss)
+        weights.append(horizon_weights[horizon_idx])
+    stacked_losses = torch.stack(losses)
+    stacked_weights = torch.stack(weights)
+    return (stacked_losses * stacked_weights).sum() / stacked_weights.sum().clamp_min(1e-6)
+
+
 def _global_pairwise_rank_loss(
     decision_scores: torch.Tensor,
     rank_targets: torch.Tensor,
@@ -568,7 +645,8 @@ def compute_losses(
     loss_context: LossContext,
     aux_targets: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    p_win_targets = targets["p_win"]
+    p_win_binary_targets = targets["p_win"].float()
+    p_win_targets = p_win_binary_targets
     p_win_head_dim = int(p_win_targets.shape[1]) if p_win_targets.ndim == 2 else 1
     horizon_idx = _primary_index(config, p_win_head_dim)
     decision_scores = outputs.get("decision_score", outputs.get("rank_score"))
@@ -587,6 +665,14 @@ def compute_losses(
         * loss_context.p_win_horizon_weight.unsqueeze(0)
         * p_win_sample_weight
     ).mean()
+    loss_p_win_brier = outputs["p_win"].new_tensor(0.0)
+    if config.p_win_brier_weight > 0:
+        p_win_prob = torch.sigmoid(outputs["p_win"])
+        loss_p_win_brier = F.mse_loss(p_win_prob, p_win_binary_targets, reduction="none")
+        loss_p_win_brier = (loss_p_win_brier * loss_context.p_win_horizon_weight.unsqueeze(0)).mean()
+    loss_p_win_logit_l2 = outputs["p_win"].new_tensor(0.0)
+    if config.p_win_logit_l2_weight > 0:
+        loss_p_win_logit_l2 = (outputs["p_win"].float().pow(2) * loss_context.p_win_horizon_weight.unsqueeze(0)).mean()
     loss_ret_mu = F.smooth_l1_loss(outputs["ret_mu"], targets["ret_mu"], reduction="none")
     loss_ret_mu = (loss_ret_mu * loss_context.ret_mu_horizon_weight.unsqueeze(0)).mean()
     loss_ret_sigma = outputs["p_win"].new_tensor(0.0)
@@ -621,16 +707,10 @@ def compute_losses(
     date_idx = None
     if aux_targets and "date_idx" in aux_targets:
         date_idx = aux_targets["date_idx"]
-    loss_rank_pairwise = (
-        _pairwise_rank_loss(
-            decision_scores,
-            targets["ret_mu"],
-            date_idx,
-            horizon_idx=horizon_idx,
-        )
-        if config.rank_pairwise_weight > 0 and decision_scores is not None
-        else outputs["p_win"].new_tensor(0.0)
-    )
+    loss_rank_pairwise = outputs["p_win"].new_tensor(0.0)
+    if config.rank_pairwise_weight > 0 and decision_scores is not None:
+        utility_targets = _risk_adjusted_utility_targets(targets, decision_scores.size(1))
+        loss_rank_pairwise = _multi_horizon_pairwise_rank_loss(decision_scores, utility_targets, date_idx)
     if (
         config.rank_pairwise_weight > 0
         and decision_scores is not None
@@ -677,6 +757,8 @@ def compute_losses(
         )
     total = (
         config.p_win_weight * loss_p_win
+        + config.p_win_brier_weight * loss_p_win_brier
+        + config.p_win_logit_l2_weight * loss_p_win_logit_l2
         + config.ret_mu_weight * loss_ret_mu
         + config.ret_sigma_weight * loss_ret_sigma
         + config.risk_dd_weight * loss_risk_dd
@@ -691,6 +773,8 @@ def compute_losses(
     )
     return total, {
         "loss_p_win": loss_p_win,
+        "loss_p_win_brier": loss_p_win_brier,
+        "loss_p_win_logit_l2": loss_p_win_logit_l2,
         "loss_ret_mu": loss_ret_mu,
         "loss_ret_sigma": loss_ret_sigma,
         "loss_risk_dd": loss_risk_dd,
@@ -843,6 +927,8 @@ def _init_running_totals(
         "p_win_true_positive_by_head": torch.zeros(p_win_head_dim, dtype=torch.float64),
         "p_win_true_negative_by_head": torch.zeros(p_win_head_dim, dtype=torch.float64),
         "p_win_prob_sum_by_head": torch.zeros(p_win_head_dim, dtype=torch.float64),
+        "p_win_logit_sum_by_head": torch.zeros(p_win_head_dim, dtype=torch.float64),
+        "p_win_logit_sq_sum_by_head": torch.zeros(p_win_head_dim, dtype=torch.float64),
         "ret_mu_abs_by_head": torch.zeros(ret_mu_head_dim, dtype=torch.float64),
         "ret_mu_total_by_head": torch.zeros(ret_mu_head_dim, dtype=torch.float64),
         "risk_dd_abs_by_head": torch.zeros(risk_dd_head_dim, dtype=torch.float64),
@@ -882,6 +968,15 @@ def _finalize_metrics(running: dict[str, Any]) -> dict[str, Any]:
         p_win_target_pos_rate_by_head,
         1.0 - p_win_target_pos_rate_by_head,
     )
+    p_win_logit_mean_by_head = _safe_tensor_ratio(
+        running["p_win_logit_sum_by_head"],
+        running["p_win_total_by_head"],
+    )
+    p_win_logit_sq_mean_by_head = _safe_tensor_ratio(
+        running["p_win_logit_sq_sum_by_head"],
+        running["p_win_total_by_head"],
+    )
+    p_win_logit_std_by_head = (p_win_logit_sq_mean_by_head - p_win_logit_mean_by_head.pow(2)).clamp_min(0.0).sqrt()
     ret_mu_mae_by_head = _safe_tensor_ratio(running["ret_mu_abs_by_head"], running["ret_mu_total_by_head"])
     risk_dd_mae_by_head = _safe_tensor_ratio(running["risk_dd_abs_by_head"], running["risk_dd_total_by_head"])
     topk_metrics = _compute_topk_metrics_from_chunks(running)
@@ -899,6 +994,8 @@ def _finalize_metrics(running: dict[str, Any]) -> dict[str, Any]:
         "p_win_target_pos_rate_by_head": [float(value) for value in p_win_target_pos_rate_by_head.tolist()],
         "p_win_pred_pos_rate_by_head": [float(value) for value in p_win_pred_pos_rate_by_head.tolist()],
         "p_win_prob_mean_by_head": [float(value) for value in p_win_prob_mean_by_head.tolist()],
+        "p_win_logit_mean_by_head": [float(value) for value in p_win_logit_mean_by_head.tolist()],
+        "p_win_logit_std_by_head": [float(value) for value in p_win_logit_std_by_head.tolist()],
         "p_win_majority_baseline_by_head": [float(value) for value in p_win_majority_baseline_by_head.tolist()],
         "ret_mu_mae_by_head": [float(value) for value in ret_mu_mae_by_head.tolist()],
         "risk_dd_mae_by_head": [float(value) for value in risk_dd_mae_by_head.tolist()],
@@ -941,6 +1038,12 @@ def flatten_metrics_for_history(prefix: str, metrics: dict[str, Any]) -> dict[st
         flattened[f"{prefix}_p_win_target_pos_rate_{label}"] = float(value)
     for label, value in zip(p_win_labels, metrics.get("p_win_pred_pos_rate_by_head", [])):
         flattened[f"{prefix}_p_win_pred_pos_rate_{label}"] = float(value)
+    for label, value in zip(p_win_labels, metrics.get("p_win_prob_mean_by_head", [])):
+        flattened[f"{prefix}_p_win_prob_mean_{label}"] = float(value)
+    for label, value in zip(p_win_labels, metrics.get("p_win_logit_mean_by_head", [])):
+        flattened[f"{prefix}_p_win_logit_mean_{label}"] = float(value)
+    for label, value in zip(p_win_labels, metrics.get("p_win_logit_std_by_head", [])):
+        flattened[f"{prefix}_p_win_logit_std_{label}"] = float(value)
     for label, value in zip(p_win_labels, metrics.get("p_win_majority_baseline_by_head", [])):
         flattened[f"{prefix}_p_win_majority_baseline_{label}"] = float(value)
     for label, value in zip(ret_labels, metrics.get("ret_mu_mae_by_head", [])):
@@ -1032,7 +1135,8 @@ def _update_metrics_from_batch(
     for name in LOSS_PART_NAMES:
         running[f"{name}_sum"] += float(parts[name].detach().item()) * batch_size
 
-    p_win_prob = torch.sigmoid(outputs["p_win"].detach())
+    p_win_logits = outputs["p_win"].detach().float()
+    p_win_prob = torch.sigmoid(p_win_logits)
     p_win_pred = (p_win_prob >= p_win_thresholds.unsqueeze(0)).float()
     p_win_true = batch["y"]["p_win"]
     p_win_true_binary = (p_win_true >= 0.5).float()
@@ -1055,6 +1159,8 @@ def _update_metrics_from_batch(
         (p_win_pred_binary == 0.0) & (p_win_true_binary == 0.0)
     ).sum(dim=0).double().cpu()
     running["p_win_prob_sum_by_head"] += p_win_prob.sum(dim=0).double().cpu()
+    running["p_win_logit_sum_by_head"] += p_win_logits.sum(dim=0).double().cpu()
+    running["p_win_logit_sq_sum_by_head"] += p_win_logits.pow(2).sum(dim=0).double().cpu()
     running["ret_mu_abs"] += float(torch.abs(outputs["ret_mu"].detach() - batch["y"]["ret_mu"]).sum().item())
     running["ret_mu_total"] += float(batch["y"]["ret_mu"].numel())
     running["ret_mu_abs_by_head"] += torch.abs(
@@ -1180,6 +1286,23 @@ def evaluate(
             acc=f"{metrics['p_win_acc']:.3f}",
         )
     return _finalize_metrics(running)
+
+
+def evaluate_limited(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: TrainConfig,
+    loss_context: LossContext,
+    desc: str,
+    max_batches: int,
+) -> dict[str, Any]:
+    original_max_eval_batches = config.max_eval_batches
+    config.max_eval_batches = max(1, int(max_batches))
+    try:
+        return evaluate(model, loader, device, config, loss_context, desc=desc)
+    finally:
+        config.max_eval_batches = original_max_eval_batches
 
 
 def checkpoint_payload(
@@ -1360,21 +1483,47 @@ def main() -> None:
             loss_context,
             ema=ema,
         )
-        eval_model = ema.shadow if ema is not None else model
-        valid_metrics = evaluate(
-            eval_model,
+        valid_live_metrics = evaluate(
+            model,
             bundle.valid_loader,
             device,
             config,
             loss_context,
-            desc=f"Epoch {epoch} [valid]",
+            desc=f"Epoch {epoch} [valid live]",
         )
+        if ema is not None:
+            valid_ema_metrics = evaluate(
+                ema.shadow,
+                bundle.valid_loader,
+                device,
+                config,
+                loss_context,
+                desc=f"Epoch {epoch} [valid EMA]",
+            )
+        else:
+            valid_ema_metrics = valid_live_metrics
+        valid_metrics = valid_ema_metrics
+        eval_model = ema.shadow if ema is not None else model
+        train_live_eval_metrics: dict[str, Any] = {}
+        if config.diagnostic_eval_batches > 0:
+            train_live_eval_metrics = evaluate_limited(
+                model,
+                bundle.train_loader,
+                device,
+                config,
+                loss_context,
+                desc=f"Epoch {epoch} [train live eval]",
+                max_batches=config.diagnostic_eval_batches,
+            )
         scheduler.step()
 
         record = {
             "epoch": float(epoch),
             "lr": optimizer.param_groups[0]["lr"],
             **flatten_metrics_for_history("train", train_metrics),
+            **flatten_metrics_for_history("train_live_eval", train_live_eval_metrics),
+            **flatten_metrics_for_history("valid_live", valid_live_metrics),
+            **flatten_metrics_for_history("valid_ema", valid_ema_metrics),
             **flatten_metrics_for_history("valid", valid_metrics),
         }
         history.append(record)
@@ -1387,6 +1536,7 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_metrics['loss']:.4f} valid_loss={valid_metrics['loss']:.4f} "
+            f"valid_live_loss={valid_live_metrics['loss']:.4f} "
             f"valid_acc={valid_metrics['p_win_acc']:.4f} "
             f"valid_business={valid_metrics['business_score']:.4f} "
             f"topk_util={valid_metrics['topk_utility']:.4f} "

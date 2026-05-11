@@ -384,12 +384,15 @@ class HorizonDecisionHead(nn.Module):
         output_horizons: tuple[int, ...],
         hidden_dim: int,
         active_aux_features: tuple[str, ...] | list[str] | None = None,
+        detach_aux_inputs: bool = True,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.output_horizons = tuple(output_horizons)
         self.aux_feature_count = len(DECISION_AUX_FEATURES)
-        self.active_aux_features = set(active_aux_features or DECISION_AUX_FEATURES)
+        resolved_aux_features = DECISION_AUX_FEATURES if active_aux_features is None else active_aux_features
+        self.active_aux_features = set(resolved_aux_features)
+        self.detach_aux_inputs = bool(detach_aux_inputs)
         self.heads = nn.ModuleDict(
             {
                 str(horizon): nn.Sequential(
@@ -416,6 +419,8 @@ class HorizonDecisionHead(nn.Module):
         return values[:, column_idx : column_idx + 1]
 
     def _active_or_zeros(self, feature_name: str, values: torch.Tensor) -> torch.Tensor:
+        if self.detach_aux_inputs:
+            values = values.detach()
         if feature_name in self.active_aux_features:
             return values
         return torch.zeros_like(values)
@@ -528,6 +533,7 @@ class ProfessionalFinancialModel(nn.Module):
         task_hidden_dim: int = 128,
         horizon_expert_dim: int = 128,
         decision_aux_features: tuple[str, ...] | list[str] | None = None,
+        decision_detach_aux: bool = True,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
@@ -653,6 +659,7 @@ class ProfessionalFinancialModel(nn.Module):
             output_horizons=decision_horizons or HORIZONS[: max(1, p_win_dim)],
             hidden_dim=task_hidden_dim,
             active_aux_features=decision_aux_features,
+            detach_aux_inputs=decision_detach_aux,
             dropout=dropout,
         )
         self.p_win_regime_head: nn.Module | None = None
