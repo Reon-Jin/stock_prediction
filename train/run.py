@@ -126,7 +126,7 @@ def recommended_batch_size(device_name: str) -> int:
         print("Using CPU")
         return 128
     print("Using GPU")
-    return 8192
+    return 2048
 
 
 def parse_args() -> TrainConfig:
@@ -168,10 +168,10 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--sampler-balance-horizon-index", type=int, default=1)
     parser.add_argument("--p-win-weight", type=float, default=0.9)
     parser.add_argument("--ret-mu-weight", type=float, default=1.0)
-    parser.add_argument("--ret-sigma-weight", type=float, default=0.0)
-    parser.add_argument("--risk-dd-weight", type=float, default=0.0)
-    parser.add_argument("--bigloss-weight", type=float, default=0.0)
-    parser.add_argument("--upside-weight", type=float, default=0.0)
+    parser.add_argument("--ret-sigma-weight", type=float, default=0.05)
+    parser.add_argument("--risk-dd-weight", type=float, default=0.1)
+    parser.add_argument("--bigloss-weight", type=float, default=0.05)
+    parser.add_argument("--upside-weight", type=float, default=0.05)
     parser.add_argument("--rank-pairwise-weight", type=float, default=1.0)
     parser.add_argument("--rank-score-weight", type=float, default=0.0)
     parser.add_argument("--bigloss-margin-weight", type=float, default=0.0)
@@ -315,6 +315,18 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
     return moved
 
 
+def decision_aux_features_from_config(config: TrainConfig) -> list[str]:
+    feature_weights = {
+        "ret_mu": config.ret_mu_weight,
+        "ret_sigma": config.ret_sigma_weight,
+        "p_win": config.p_win_weight,
+        "risk_dd": config.risk_dd_weight,
+        "bigloss": config.bigloss_weight,
+        "upside": config.upside_weight,
+    }
+    return [feature_name for feature_name, weight in feature_weights.items() if float(weight) > 0.0]
+
+
 def build_model_kwargs(config: TrainConfig) -> dict[str, Any]:
     return {
         "seq_model_dim": config.seq_model_dim,
@@ -325,6 +337,7 @@ def build_model_kwargs(config: TrainConfig) -> dict[str, Any]:
         "company_dim": config.company_dim,
         "fusion_dim": config.fusion_dim,
         "task_hidden_dim": config.task_hidden_dim,
+        "decision_aux_features": decision_aux_features_from_config(config),
         "dropout": config.dropout,
     }
 

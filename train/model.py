@@ -383,11 +383,13 @@ class HorizonDecisionHead(nn.Module):
         expert_dim: int,
         output_horizons: tuple[int, ...],
         hidden_dim: int,
+        active_aux_features: tuple[str, ...] | list[str] | None = None,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.output_horizons = tuple(output_horizons)
         self.aux_feature_count = len(DECISION_AUX_FEATURES)
+        self.active_aux_features = set(active_aux_features or DECISION_AUX_FEATURES)
         self.heads = nn.ModuleDict(
             {
                 str(horizon): nn.Sequential(
@@ -413,6 +415,11 @@ class HorizonDecisionHead(nn.Module):
             return torch.zeros(batch_size, 1, dtype=dtype, device=device)
         return values[:, column_idx : column_idx + 1]
 
+    def _active_or_zeros(self, feature_name: str, values: torch.Tensor) -> torch.Tensor:
+        if feature_name in self.active_aux_features:
+            return values
+        return torch.zeros_like(values)
+
     def forward(
         self,
         expert_reprs: dict[int, torch.Tensor],
@@ -424,15 +431,18 @@ class HorizonDecisionHead(nn.Module):
         dtype = next(iter(expert_reprs.values())).dtype
         columns: list[torch.Tensor] = []
         for column_idx, horizon in enumerate(self.output_horizons):
-            features = [
-                expert_reprs[horizon],
-                self._column_or_zeros(outputs.get("ret_mu"), column_idx, batch_size, device, dtype),
-                self._column_or_zeros(outputs.get("ret_sigma"), column_idx, batch_size, device, dtype),
-                torch.sigmoid(self._column_or_zeros(outputs.get("p_win"), column_idx, batch_size, device, dtype)),
-                self._column_or_zeros(outputs.get("risk_dd"), column_idx, batch_size, device, dtype),
-                self._column_or_zeros(bigloss_by_horizon, column_idx, batch_size, device, dtype),
-                self._column_or_zeros(outputs.get("upside"), column_idx, batch_size, device, dtype),
-            ]
+            aux_values = {
+                "ret_mu": self._column_or_zeros(outputs.get("ret_mu"), column_idx, batch_size, device, dtype),
+                "ret_sigma": self._column_or_zeros(outputs.get("ret_sigma"), column_idx, batch_size, device, dtype),
+                "p_win": torch.sigmoid(
+                    self._column_or_zeros(outputs.get("p_win"), column_idx, batch_size, device, dtype)
+                ),
+                "risk_dd": self._column_or_zeros(outputs.get("risk_dd"), column_idx, batch_size, device, dtype),
+                "bigloss": self._column_or_zeros(bigloss_by_horizon, column_idx, batch_size, device, dtype),
+                "upside": self._column_or_zeros(outputs.get("upside"), column_idx, batch_size, device, dtype),
+            }
+            features = [expert_reprs[horizon]]
+            features.extend(self._active_or_zeros(feature_name, aux_values[feature_name]) for feature_name in DECISION_AUX_FEATURES)
             columns.append(self.heads[str(horizon)](torch.cat(features, dim=-1)))
         return torch.cat(columns, dim=-1)
 
@@ -517,6 +527,7 @@ class ProfessionalFinancialModel(nn.Module):
         fusion_dim: int = 256,
         task_hidden_dim: int = 128,
         horizon_expert_dim: int = 128,
+        decision_aux_features: tuple[str, ...] | list[str] | None = None,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
@@ -641,6 +652,7 @@ class ProfessionalFinancialModel(nn.Module):
             expert_dim=horizon_expert_dim,
             output_horizons=decision_horizons or HORIZONS[: max(1, p_win_dim)],
             hidden_dim=task_hidden_dim,
+            active_aux_features=decision_aux_features,
             dropout=dropout,
         )
         self.p_win_regime_head: nn.Module | None = None
