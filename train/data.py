@@ -895,18 +895,18 @@ def build_weighted_train_sampler(
 def build_data_bundle(
     train_path: Path,
     valid_path: Path,
-    test_path: Path,
     cache_dir: Path,
     seq_length: int,
     batch_size: int,
     num_workers: int | None,
+    test_path: Path | None = None,
     rebuild_cache: bool = False,
     device_type: str = "cpu",
     use_weighted_sampler: bool = False,
     sampler_recency_power: float = 1.5,
     sampler_positive_balance_power: float = 0.5,
     sampler_balance_horizon_index: int = 1,
-    load_test_split: bool = True,
+    load_test_split: bool = False,
     merge_test_into_valid: bool = False,
     pre_normalize_features: bool = False,
 ) -> DataBundle:
@@ -914,13 +914,15 @@ def build_data_bundle(
     normalizer = FeatureNormalizer.fit(train_split)
     valid_source_path = valid_path
     valid_split_name = "valid"
-    if merge_test_into_valid and test_path.exists():
+    if merge_test_into_valid and test_path is not None and test_path.exists():
         valid_source_path = materialize_merged_validation_split(valid_path, test_path, cache_dir)
         valid_split_name = "valid_merged"
     valid_split = build_or_load_split(valid_split_name, valid_source_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
     test_split = None
     test_loader = None
     if load_test_split and not merge_test_into_valid:
+        if test_path is None:
+            raise ValueError("test_path is required when load_test_split=True")
         test_split = build_or_load_split("test", test_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
 
     if pre_normalize_features:

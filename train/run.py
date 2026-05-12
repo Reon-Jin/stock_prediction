@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from train.data import DataBundle, build_data_bundle, load_split_for_evaluation
+from train.data import DataBundle, build_data_bundle
 from train.model import BIGLOSS_HORIZONS, BIGLOSS_PROXY_BY_HORIZON, HORIZONS, TinyMultiInputModel
 from train.visualization import plot_business_history, plot_topk_metrics, plot_training_history
 
@@ -55,7 +55,6 @@ LOSS_PART_NAMES = (
 class TrainConfig:
     train_path: str
     valid_path: str
-    test_path: str
     output_dir: str
     cache_dir: str
     seq_length: int
@@ -113,7 +112,6 @@ class TrainConfig:
     expert_gate_min_entropy_ratio: float
     expert_gate_max_entropy_ratio: float
     expert_gate_prior_weight: float
-    merge_test_into_valid: bool
     primary_horizon_index: int
     topk: int
     best_model_metric: str
@@ -152,23 +150,22 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train a professional multi-input financial prediction model.")
     parser.add_argument("--train-path", type=str, default="data/exports/train.parquet")
     parser.add_argument("--valid-path", type=str, default="data/exports/valid.parquet")
-    parser.add_argument("--test-path", type=str, default="data/exports/test.parquet")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="train/cache")
     parser.add_argument("--seq-length", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--seq-model-dim", type=int, default=96)
-    parser.add_argument("--seq-output-dim", type=int, default=128)
+    parser.add_argument("--seq-model-dim", type=int, default=64)
+    parser.add_argument("--seq-output-dim", type=int, default=96)
     parser.add_argument("--seq-attn-heads", type=int, default=4)
     parser.add_argument("--branch-hidden-dim", type=int, default=192)
     parser.add_argument("--context-dim", type=int, default=96)
     parser.add_argument("--company-dim", type=int, default=48)
     parser.add_argument("--fusion-dim", type=int, default=256)
-    parser.add_argument("--task-hidden-dim", type=int, default=128)
+    parser.add_argument("--task-hidden-dim", type=int, default=192)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -181,7 +178,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--use-amp", action="store_true", help="Enable CUDA autocast; float32 is the default.")
     parser.add_argument("--focal-gamma", type=float, default=0.25)
-    parser.add_argument("--p-win-brier-weight", type=float, default=0.05)
+    parser.add_argument("--p-win-brier-weight", type=float, default=0.01)
     parser.add_argument("--p-win-logit-l2-weight", type=float, default=1e-4)
     parser.add_argument("--no-decision-detach-aux", action="store_true")
     parser.add_argument("--disable-horizon-source-gate", action="store_true")
@@ -190,11 +187,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--sampler-recency-power", type=float, default=1.5)
     parser.add_argument("--sampler-positive-balance-power", type=float, default=0.5)
     parser.add_argument("--sampler-balance-horizon-index", type=int, default=1)
-    parser.add_argument("--p-win-weight", type=float, default=0.9)
+    parser.add_argument("--p-win-weight", type=float, default=1.2)
     parser.add_argument("--ret-mu-weight", type=float, default=1.0)
     parser.add_argument("--ret-sigma-weight", type=float, default=0.05)
     parser.add_argument("--risk-dd-weight", type=float, default=0.1)
-    parser.add_argument("--bigloss-weight", type=float, default=0.05)
+    parser.add_argument("--bigloss-weight", type=float, default=0.1)
     parser.add_argument("--upside-weight", type=float, default=0.05)
     parser.add_argument("--rank-pairwise-weight", type=float, default=1.0)
     parser.add_argument("--rank-score-weight", type=float, default=0.0)
@@ -204,13 +201,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--p-win-regime-weight", type=float, default=0.0)
     parser.add_argument("--p-win-negative-weight", type=float, default=1.18)
     parser.add_argument("--p-win-downside-weight", type=float, default=0.75)
-    parser.add_argument("--prediction-entropy-weight", type=float, default=0.02)
+    parser.add_argument("--prediction-entropy-weight", type=float, default=0.05)
     parser.add_argument("--prediction-entropy-target-std", type=float, default=0.06)
     parser.add_argument("--expert-gate-entropy-weight", type=float, default=0.02)
     parser.add_argument("--expert-gate-min-entropy-ratio", type=float, default=0.45)
     parser.add_argument("--expert-gate-max-entropy-ratio", type=float, default=0.92)
     parser.add_argument("--expert-gate-prior-weight", type=float, default=0.005)
-    parser.add_argument("--keep-test-split", action="store_true")
     parser.add_argument("--primary-horizon-index", type=int, default=2, help="0-based main horizon; default 2 means 10d.")
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument(
@@ -242,7 +238,6 @@ def parse_args() -> TrainConfig:
     return TrainConfig(
         train_path=args.train_path,
         valid_path=args.valid_path,
-        test_path=args.test_path,
         output_dir=output_dir,
         cache_dir=args.cache_dir,
         seq_length=args.seq_length,
@@ -300,7 +295,6 @@ def parse_args() -> TrainConfig:
         expert_gate_min_entropy_ratio=args.expert_gate_min_entropy_ratio,
         expert_gate_max_entropy_ratio=args.expert_gate_max_entropy_ratio,
         expert_gate_prior_weight=args.expert_gate_prior_weight,
-        merge_test_into_valid=not args.keep_test_split,
         primary_horizon_index=args.primary_horizon_index,
         topk=args.topk,
         best_model_metric=args.best_model_metric,
@@ -1635,16 +1629,10 @@ def build_model(bundle: DataBundle, config: TrainConfig, device: torch.device) -
 
 
 def print_split_summary(bundle: DataBundle, config: TrainConfig) -> None:
-    test_summary = "test split deferred until final evaluation"
-    if config.merge_test_into_valid:
-        test_summary = "test split merged into validation"
-    if bundle.test_split is not None:
-        test_summary = f"test rows={bundle.test_split.row_count:,} samples={bundle.test_split.sample_count:,}"
     print("Prepared datasets:")
     print(
         f"  train rows={bundle.train_split.row_count:,} samples={bundle.train_split.sample_count:,} "
-        f"valid rows={bundle.valid_split.row_count:,} samples={bundle.valid_split.sample_count:,} "
-        f"{test_summary}"
+        f"valid rows={bundle.valid_split.row_count:,} samples={bundle.valid_split.sample_count:,}"
     )
     print(
         f"  dims: seq={bundle.train_split.input_dims['f_seq']} "
@@ -1674,7 +1662,6 @@ def main() -> None:
     bundle = build_data_bundle(
         train_path=PROJECT_ROOT / config.train_path,
         valid_path=PROJECT_ROOT / config.valid_path,
-        test_path=PROJECT_ROOT / config.test_path,
         cache_dir=cache_dir,
         seq_length=config.seq_length,
         batch_size=config.batch_size,
@@ -1685,8 +1672,6 @@ def main() -> None:
         sampler_recency_power=config.sampler_recency_power,
         sampler_positive_balance_power=config.sampler_positive_balance_power,
         sampler_balance_horizon_index=config.sampler_balance_horizon_index,
-        load_test_split=not config.merge_test_into_valid,
-        merge_test_into_valid=config.merge_test_into_valid,
         pre_normalize_features=config.pre_normalize_features,
     )
     print_split_summary(bundle, config)
@@ -1868,41 +1853,11 @@ def main() -> None:
         p_win_thresholds=calibrated_thresholds,
     )
     gc.collect()
-    test_metrics_raw: dict[str, Any] = {}
-    test_metrics: dict[str, Any] = {}
-    if not config.merge_test_into_valid:
-        print("Loading deferred test split for final evaluation...")
-        test_split, test_loader = load_split_for_evaluation(
-            split_name="test",
-            source_path=PROJECT_ROOT / config.test_path,
-            cache_dir=cache_dir,
-            seq_length=config.seq_length,
-            normalizer=bundle.normalizer,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            rebuild_cache=config.rebuild_cache,
-            device_type=device.type,
-            pre_normalize_features=config.pre_normalize_features,
-        )
-        print(f"Test split ready: rows={test_split.row_count:,} samples={test_split.sample_count:,}")
-        test_metrics_raw = evaluate(model, test_loader, device, config, loss_context, desc="Test")
-        test_metrics = evaluate(
-            model,
-            test_loader,
-            device,
-            config,
-            loss_context,
-            desc="Test calibrated",
-            p_win_thresholds=calibrated_thresholds,
-        )
     total_minutes = (time.time() - training_started_at) / 60.0
 
     checkpoint["p_win_thresholds"] = calibrated_thresholds.cpu()
     checkpoint["valid_metrics_raw"] = best_valid_metrics_raw
     checkpoint["valid_metrics_calibrated"] = best_valid_metrics_calibrated
-    checkpoint["test_metrics_raw"] = test_metrics_raw
-    checkpoint["test_metrics_calibrated"] = test_metrics
-    checkpoint["test_evaluation_skipped"] = bool(config.merge_test_into_valid)
     torch.save(checkpoint, checkpoint_path)
 
     metrics_payload = {
@@ -1912,32 +1867,17 @@ def main() -> None:
         "best_metric_value": best_metric_value,
         "valid_metrics_raw": best_valid_metrics_raw,
         "valid_metrics_calibrated": best_valid_metrics_calibrated,
-        "test_metrics_raw": test_metrics_raw,
-        "test_metrics_calibrated": test_metrics,
-        "test_evaluation_skipped": bool(config.merge_test_into_valid),
-        "validation_includes_test": bool(config.merge_test_into_valid),
         "p_win_thresholds": [float(value) for value in calibrated_thresholds.cpu().tolist()],
         "train_minutes": total_minutes,
     }
     save_json(output_dir / "validation_metrics.json", metrics_payload)
-    save_json(output_dir / "test_metrics.json", metrics_payload)
-    if config.merge_test_into_valid:
-        print(
-            f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} "
-            f"valid_loss={best_valid_loss:.4f} | final validation includes previous test split; "
-            f"valid_acc={best_valid_metrics_calibrated['p_win_acc']:.4f} "
-            f"valid_ret_mae={best_valid_metrics_calibrated['ret_mu_mae']:.4f} "
-            f"valid_dd_mae={best_valid_metrics_calibrated['risk_dd_mae']:.4f}"
-        )
-    else:
-        print(
-            f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} valid_loss={best_valid_loss:.4f} | "
-            f"test_loss={test_metrics['loss']:.4f} test_acc={test_metrics['p_win_acc']:.4f} "
-            f"(raw_acc={test_metrics_raw['p_win_acc']:.4f}) "
-            f"test_ret_mae={test_metrics['ret_mu_mae']:.4f} "
-            f"test_dd_mae={test_metrics['risk_dd_mae']:.4f} "
-            f"test_rank_mae={test_metrics['rank_score_mae']:.4f}"
-        )
+    print(
+        f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} "
+        f"valid_loss={best_valid_loss:.4f} | "
+        f"valid_acc={best_valid_metrics_calibrated['p_win_acc']:.4f} "
+        f"valid_ret_mae={best_valid_metrics_calibrated['ret_mu_mae']:.4f} "
+        f"valid_dd_mae={best_valid_metrics_calibrated['risk_dd_mae']:.4f}"
+    )
     print(f"Artifacts saved to: {output_dir}")
 
 
