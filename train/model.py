@@ -158,16 +158,14 @@ class TemporalFinancialEncoder(nn.Module):
             [
                 TemporalMixerBlock(model_dim, kernel_size=3, dropout=dropout),
                 TemporalMixerBlock(model_dim, kernel_size=5, dropout=dropout),
-                TemporalMixerBlock(model_dim, kernel_size=3, dropout=dropout),
             ]
         )
         self.gru = nn.GRU(
             input_size=model_dim,
             hidden_size=model_dim,
-            num_layers=2,
+            num_layers=1,
             batch_first=True,
             bidirectional=False,
-            dropout=dropout,
         )
         self.self_attention = nn.MultiheadAttention(model_dim, num_heads=attn_heads, dropout=dropout, batch_first=True)
         self.attn_norm = nn.LayerNorm(model_dim)
@@ -309,7 +307,7 @@ class LongTermHorizonExpert(nn.Module):
             nn.Sigmoid(),
         )
         self.blocks = nn.ModuleList(
-            [GatedResidualBlock(expert_dim, expert_dim * 2, dropout=stable_dropout) for _ in range(3)]
+            [GatedResidualBlock(expert_dim, expert_dim * 2, dropout=stable_dropout) for _ in range(2)]
         )
         self.output = nn.Sequential(nn.LayerNorm(expert_dim), nn.Linear(expert_dim, expert_dim), nn.GELU())
 
@@ -585,12 +583,12 @@ class ProfessionalFinancialModel(nn.Module):
         seq_model_dim: int = 96,
         seq_output_dim: int = 128,
         seq_attn_heads: int = 4,
-        branch_hidden_dim: int = 192,
+        branch_hidden_dim: int = 128,
         context_dim: int = 96,
         company_dim: int = 48,
-        fusion_dim: int = 256,
+        fusion_dim: int = 192,
         task_hidden_dim: int = 128,
-        horizon_expert_dim: int = 128,
+        horizon_expert_dim: int = 96,
         horizon_source_gate: bool = False,
         decision_aux_features: tuple[str, ...] | list[str] | None = None,
         decision_detach_aux: bool = True,
@@ -648,7 +646,7 @@ class ProfessionalFinancialModel(nn.Module):
             nn.Dropout(dropout),
         )
         self.fusion_blocks = nn.ModuleList(
-            [GatedResidualBlock(fusion_dim, fusion_dim * 2, dropout=dropout) for _ in range(3)]
+            [GatedResidualBlock(fusion_dim, fusion_dim * 2, dropout=dropout) for _ in range(2)]
         )
         self.shared_out = nn.Sequential(
             nn.LayerNorm(fusion_dim),
