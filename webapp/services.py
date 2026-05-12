@@ -538,6 +538,8 @@ def list_model_runs(limit: int = 8) -> list[dict[str, Any]]:
         metrics: dict[str, Any] = {}
         if metrics_path.exists():
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        test_metrics_raw = metrics.get("test_metrics_raw") or {}
+        test_evaluation_skipped = bool(metrics.get("test_evaluation_skipped"))
         runs.append(
             {
                 "run_name": run_dir.name,
@@ -545,9 +547,10 @@ def list_model_runs(limit: int = 8) -> list[dict[str, Any]]:
                 "updated_at": _to_iso(datetime.fromtimestamp(run_dir.stat().st_mtime)),
                 "train_minutes": metrics.get("train_minutes"),
                 "best_valid_loss": metrics.get("best_valid_loss"),
-                "test_p_win_acc": metrics.get("test_metrics_raw", {}).get("p_win_acc"),
-                "test_rank_score_mae": metrics.get("test_metrics_raw", {}).get("rank_score_mae"),
-                "has_test_metrics": metrics_path.exists(),
+                "test_p_win_acc": None if test_evaluation_skipped else test_metrics_raw.get("p_win_acc"),
+                "test_rank_score_mae": None if test_evaluation_skipped else test_metrics_raw.get("rank_score_mae"),
+                "has_test_metrics": metrics_path.exists() and not test_evaluation_skipped,
+                "validation_includes_test": bool(metrics.get("validation_includes_test")),
             }
         )
     return runs

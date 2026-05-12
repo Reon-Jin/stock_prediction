@@ -45,6 +45,9 @@ LOSS_PART_NAMES = (
     "loss_anti_conservative",
     "loss_calibration",
     "loss_p_win_regime",
+    "loss_prediction_entropy",
+    "loss_expert_gate_entropy",
+    "loss_expert_gate_prior",
 )
 
 
@@ -84,6 +87,7 @@ class TrainConfig:
     p_win_brier_weight: float
     p_win_logit_l2_weight: float
     decision_detach_aux: bool
+    horizon_source_gate: bool
     diagnostic_eval_batches: int
     use_weighted_sampler: bool
     sampler_recency_power: float
@@ -103,6 +107,13 @@ class TrainConfig:
     p_win_regime_weight: float
     p_win_negative_weight: float
     p_win_downside_weight: float
+    prediction_entropy_weight: float
+    prediction_entropy_target_std: float
+    expert_gate_entropy_weight: float
+    expert_gate_min_entropy_ratio: float
+    expert_gate_max_entropy_ratio: float
+    expert_gate_prior_weight: float
+    merge_test_into_valid: bool
     primary_horizon_index: int
     topk: int
     best_model_metric: str
@@ -157,7 +168,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--fusion-dim", type=int, default=256)
     parser.add_argument("--task-hidden-dim", type=int, default=128)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--rebuild-cache", action="store_true")
@@ -171,6 +182,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--p-win-brier-weight", type=float, default=0.05)
     parser.add_argument("--p-win-logit-l2-weight", type=float, default=1e-4)
     parser.add_argument("--no-decision-detach-aux", action="store_true")
+    parser.add_argument("--disable-horizon-source-gate", action="store_true")
     parser.add_argument("--diagnostic-eval-batches", type=int, default=2)
     parser.add_argument("--disable-weighted-sampler", action="store_true")
     parser.add_argument("--sampler-recency-power", type=float, default=1.5)
@@ -190,6 +202,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--p-win-regime-weight", type=float, default=0.0)
     parser.add_argument("--p-win-negative-weight", type=float, default=1.18)
     parser.add_argument("--p-win-downside-weight", type=float, default=0.75)
+    parser.add_argument("--prediction-entropy-weight", type=float, default=0.02)
+    parser.add_argument("--prediction-entropy-target-std", type=float, default=0.06)
+    parser.add_argument("--expert-gate-entropy-weight", type=float, default=0.02)
+    parser.add_argument("--expert-gate-min-entropy-ratio", type=float, default=0.45)
+    parser.add_argument("--expert-gate-max-entropy-ratio", type=float, default=0.92)
+    parser.add_argument("--expert-gate-prior-weight", type=float, default=0.005)
+    parser.add_argument("--keep-test-split", action="store_true")
     parser.add_argument("--primary-horizon-index", type=int, default=2, help="0-based main horizon; default 2 means 10d.")
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument(
@@ -241,6 +260,7 @@ def parse_args() -> TrainConfig:
         p_win_brier_weight=args.p_win_brier_weight,
         p_win_logit_l2_weight=args.p_win_logit_l2_weight,
         decision_detach_aux=not args.no_decision_detach_aux,
+        horizon_source_gate=not args.disable_horizon_source_gate,
         diagnostic_eval_batches=args.diagnostic_eval_batches,
         use_weighted_sampler=not args.disable_weighted_sampler,
         sampler_recency_power=args.sampler_recency_power,
@@ -260,6 +280,13 @@ def parse_args() -> TrainConfig:
         p_win_regime_weight=args.p_win_regime_weight,
         p_win_negative_weight=args.p_win_negative_weight,
         p_win_downside_weight=args.p_win_downside_weight,
+        prediction_entropy_weight=args.prediction_entropy_weight,
+        prediction_entropy_target_std=args.prediction_entropy_target_std,
+        expert_gate_entropy_weight=args.expert_gate_entropy_weight,
+        expert_gate_min_entropy_ratio=args.expert_gate_min_entropy_ratio,
+        expert_gate_max_entropy_ratio=args.expert_gate_max_entropy_ratio,
+        expert_gate_prior_weight=args.expert_gate_prior_weight,
+        merge_test_into_valid=not args.keep_test_split,
         primary_horizon_index=args.primary_horizon_index,
         topk=args.topk,
         best_model_metric=args.best_model_metric,
@@ -351,6 +378,7 @@ def build_model_kwargs(config: TrainConfig) -> dict[str, Any]:
         "company_dim": config.company_dim,
         "fusion_dim": config.fusion_dim,
         "task_hidden_dim": config.task_hidden_dim,
+        "horizon_source_gate": config.horizon_source_gate,
         "decision_aux_features": decision_aux_features_from_config(config),
         "decision_detach_aux": config.decision_detach_aux,
         "dropout": config.dropout,
@@ -468,11 +496,13 @@ def _downside_weight_matrix(
     batch_size = targets["p_win"].size(0)
     weights = torch.ones((batch_size, head_dim), dtype=torch.float32, device=device)
     negative_mask = (targets["p_win"] < 0.5).float()
-    weights = weights * (1.0 + (max(0.0, float(config.p_win_negative_weight)) - 1.0) * negative_mask)
+    negative_weight = float(_config_value(config, "p_win_negative_weight", 1.0))
+    weights = weights * (1.0 + (max(0.0, negative_weight) - 1.0) * negative_mask)
 
     if "risk_dd" in targets and targets["risk_dd"].numel() > 0:
         drawdown_severity = torch.relu((-targets["risk_dd"].float()) - 0.02)
-        drawdown_boost = 1.0 + max(0.0, float(config.p_win_downside_weight)) * drawdown_severity
+        downside_weight = float(_config_value(config, "p_win_downside_weight", 0.0))
+        drawdown_boost = 1.0 + max(0.0, downside_weight) * drawdown_severity
         weights = weights * drawdown_boost[:, :head_dim]
 
     if "bigloss" in targets and targets["bigloss"].numel() > 0:
@@ -485,7 +515,11 @@ def _downside_weight_matrix(
 def _primary_index(config: TrainConfig, width: int) -> int:
     if width <= 0:
         return 0
-    return min(max(int(config.primary_horizon_index), 0), width - 1)
+    return min(max(int(_config_value(config, "primary_horizon_index", 0)), 0), width - 1)
+
+
+def _config_value(config: Any, name: str, default: Any) -> Any:
+    return getattr(config, name, default)
 
 
 def _focal_bce_with_logits(
@@ -634,6 +668,65 @@ def _global_pairwise_rank_loss(
     return (pair_losses * pair_weights).mean()
 
 
+def _std_floor_loss(values: torch.Tensor, target_std: float) -> torch.Tensor:
+    if values.ndim < 2 or values.size(0) < 2 or values.numel() == 0:
+        return values.new_tensor(0.0)
+    finite_values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    std = finite_values.std(dim=0, unbiased=False)
+    floor = max(float(target_std), 1e-6)
+    return F.relu(floor - std).pow(2).mean() / (floor * floor)
+
+
+def _prediction_entropy_loss(
+    outputs: dict[str, torch.Tensor],
+    decision_scores: torch.Tensor | None,
+    target_std: float,
+) -> torch.Tensor:
+    base = outputs["p_win"].new_tensor(0.0)
+    losses: list[torch.Tensor] = []
+    if "p_win" in outputs:
+        losses.append(_std_floor_loss(torch.sigmoid(outputs["p_win"]), target_std))
+    if "ret_mu" in outputs:
+        losses.append(_std_floor_loss(torch.tanh(outputs["ret_mu"].float() / 0.10), target_std))
+    if decision_scores is not None:
+        losses.append(_std_floor_loss(torch.sigmoid(decision_scores.float()), target_std))
+    if not losses:
+        return base
+    return torch.stack(losses).mean()
+
+
+def _expert_gate_entropy_loss(
+    outputs: dict[str, torch.Tensor],
+    min_entropy_ratio: float,
+    max_entropy_ratio: float,
+) -> torch.Tensor:
+    weights = outputs.get("expert_source_weights")
+    if weights is None or weights.numel() == 0:
+        return outputs["p_win"].new_tensor(0.0)
+    weights = weights.float().clamp_min(1e-8)
+    entropy = -(weights * weights.log()).sum(dim=-1)
+    max_entropy = torch.log(weights.new_tensor(float(weights.size(-1))))
+    min_entropy = max_entropy * max(0.0, min(float(min_entropy_ratio), 1.0))
+    max_allowed_entropy = max_entropy * max(0.0, min(float(max_entropy_ratio), 1.0))
+    low_entropy_penalty = F.relu(min_entropy - entropy).pow(2)
+    uniform_penalty = F.relu(entropy - max_allowed_entropy).pow(2)
+    return (low_entropy_penalty + uniform_penalty).mean() / max_entropy.pow(2).clamp_min(1e-6)
+
+
+def _expert_gate_prior_loss(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    weights = outputs.get("expert_source_weights")
+    prior = outputs.get("expert_source_prior")
+    if weights is None or prior is None or weights.numel() == 0 or prior.numel() == 0:
+        return outputs["p_win"].new_tensor(0.0)
+    width = min(weights.size(0), prior.size(0))
+    source_width = min(weights.size(1), prior.size(1))
+    if width <= 0 or source_width <= 0:
+        return outputs["p_win"].new_tensor(0.0)
+    weights = weights[:width, :source_width].float().clamp_min(1e-8)
+    prior = prior[:width, :source_width].to(device=weights.device, dtype=weights.dtype).clamp_min(1e-8)
+    return F.kl_div(weights.log(), prior, reduction="batchmean")
+
+
 def _primary_index_for_width(index: int, width: int) -> int:
     return min(max(int(index), 0), max(0, int(width) - 1))
 
@@ -650,14 +743,15 @@ def compute_losses(
     p_win_head_dim = int(p_win_targets.shape[1]) if p_win_targets.ndim == 2 else 1
     horizon_idx = _primary_index(config, p_win_head_dim)
     decision_scores = outputs.get("decision_score", outputs.get("rank_score"))
-    if config.label_smoothing > 0:
-        smoothing = max(0.0, min(float(config.label_smoothing), 0.2))
+    label_smoothing = float(_config_value(config, "label_smoothing", 0.0))
+    if label_smoothing > 0:
+        smoothing = max(0.0, min(label_smoothing, 0.2))
         p_win_targets = p_win_targets * (1.0 - smoothing) + 0.5 * smoothing
     loss_p_win = _focal_bce_with_logits(
         outputs["p_win"],
         p_win_targets,
         pos_weight=loss_context.p_win_pos_weight,
-        gamma=config.focal_gamma,
+        gamma=float(_config_value(config, "focal_gamma", 0.75)),
     )
     p_win_sample_weight = _downside_weight_matrix(targets, config, p_win_head_dim)
     loss_p_win = (
@@ -666,53 +760,58 @@ def compute_losses(
         * p_win_sample_weight
     ).mean()
     loss_p_win_brier = outputs["p_win"].new_tensor(0.0)
-    if config.p_win_brier_weight > 0:
+    if float(_config_value(config, "p_win_brier_weight", 0.0)) > 0:
         p_win_prob = torch.sigmoid(outputs["p_win"])
         loss_p_win_brier = F.mse_loss(p_win_prob, p_win_binary_targets, reduction="none")
         loss_p_win_brier = (loss_p_win_brier * loss_context.p_win_horizon_weight.unsqueeze(0)).mean()
     loss_p_win_logit_l2 = outputs["p_win"].new_tensor(0.0)
-    if config.p_win_logit_l2_weight > 0:
+    if float(_config_value(config, "p_win_logit_l2_weight", 0.0)) > 0:
         loss_p_win_logit_l2 = (outputs["p_win"].float().pow(2) * loss_context.p_win_horizon_weight.unsqueeze(0)).mean()
     loss_ret_mu = F.smooth_l1_loss(outputs["ret_mu"], targets["ret_mu"], reduction="none")
     loss_ret_mu = (loss_ret_mu * loss_context.ret_mu_horizon_weight.unsqueeze(0)).mean()
     loss_ret_sigma = outputs["p_win"].new_tensor(0.0)
-    if config.ret_sigma_weight > 0 and "ret_sigma" in outputs:
+    if float(_config_value(config, "ret_sigma_weight", 0.0)) > 0 and "ret_sigma" in outputs:
         abs_error_target = torch.abs(outputs["ret_mu"].detach() - targets["ret_mu"])
         loss_ret_sigma = F.smooth_l1_loss(outputs["ret_sigma"], abs_error_target)
     loss_risk_dd = outputs["p_win"].new_tensor(0.0)
-    if config.risk_dd_weight > 0 and "risk_dd" in outputs and "risk_dd" in targets:
+    if float(_config_value(config, "risk_dd_weight", 0.0)) > 0 and "risk_dd" in outputs and "risk_dd" in targets:
         loss_risk_dd = F.smooth_l1_loss(outputs["risk_dd"], targets["risk_dd"], reduction="none")
         deep_dd_weight = 1.0 + 2.0 * (targets["risk_dd"].float() < -0.05).float()
         loss_risk_dd = loss_risk_dd * deep_dd_weight
         loss_risk_dd = (loss_risk_dd * loss_context.risk_dd_horizon_weight.unsqueeze(0)).mean()
     loss_bigloss = outputs["p_win"].new_tensor(0.0)
-    if config.bigloss_weight > 0 and "bigloss" in outputs and "bigloss" in targets and targets["bigloss"].numel() > 0:
+    if (
+        float(_config_value(config, "bigloss_weight", 0.0)) > 0
+        and "bigloss" in outputs
+        and "bigloss" in targets
+        and targets["bigloss"].numel() > 0
+    ):
         bigloss_targets = targets["bigloss"].float()
         loss_bigloss = _focal_bce_with_logits(
             outputs["bigloss"],
             bigloss_targets,
-            gamma=config.focal_gamma,
+            gamma=float(_config_value(config, "focal_gamma", 0.75)),
         )
         severity_weight = 1.0 + 2.0 * bigloss_targets
         loss_bigloss = (loss_bigloss * severity_weight).mean()
     loss_upside = outputs["p_win"].new_tensor(0.0)
-    if config.upside_weight > 0 and "upside" in outputs:
+    if float(_config_value(config, "upside_weight", 0.0)) > 0 and "upside" in outputs:
         upside_targets = torch.relu(targets["ret_mu"].float())
         strong_up_weight = 1.0 + 2.0 * (upside_targets > 0.03).float()
         loss_upside = (F.smooth_l1_loss(outputs["upside"], upside_targets, reduction="none") * strong_up_weight).mean()
     loss_rank_score = outputs["p_win"].new_tensor(0.0)
-    if config.rank_score_weight > 0 and "rank_score" in outputs and "rank_score" in targets:
+    if float(_config_value(config, "rank_score_weight", 0.0)) > 0 and "rank_score" in outputs and "rank_score" in targets:
         rank_score_pred = torch.sigmoid(outputs["rank_score"])
         loss_rank_score = F.smooth_l1_loss(rank_score_pred, targets["rank_score"])
     date_idx = None
     if aux_targets and "date_idx" in aux_targets:
         date_idx = aux_targets["date_idx"]
     loss_rank_pairwise = outputs["p_win"].new_tensor(0.0)
-    if config.rank_pairwise_weight > 0 and decision_scores is not None:
+    if float(_config_value(config, "rank_pairwise_weight", 0.0)) > 0 and decision_scores is not None:
         utility_targets = _risk_adjusted_utility_targets(targets, decision_scores.size(1))
         loss_rank_pairwise = _multi_horizon_pairwise_rank_loss(decision_scores, utility_targets, date_idx)
     if (
-        config.rank_pairwise_weight > 0
+        float(_config_value(config, "rank_pairwise_weight", 0.0)) > 0
         and decision_scores is not None
         and "rank_score" in targets
         and float(loss_rank_pairwise.detach().abs().item()) < 1e-12
@@ -720,7 +819,7 @@ def compute_losses(
         loss_rank_pairwise = _global_pairwise_rank_loss(decision_scores, targets["rank_score"], horizon_idx)
     loss_bigloss_margin = outputs["p_win"].new_tensor(0.0)
     if (
-        config.bigloss_margin_weight > 0
+        float(_config_value(config, "bigloss_margin_weight", 0.0)) > 0
         and decision_scores is not None
         and "bigloss" in targets
         and targets["bigloss"].numel() > 0
@@ -731,21 +830,21 @@ def compute_losses(
         if bool((bigloss_primary > 0.5).any().item()):
             loss_bigloss_margin = F.relu(decision_primary[bigloss_primary > 0.5]).mean()
     loss_anti_conservative = outputs["p_win"].new_tensor(0.0)
-    if config.anti_conservative_weight > 0 and decision_scores is not None:
+    if float(_config_value(config, "anti_conservative_weight", 0.0)) > 0 and decision_scores is not None:
         decision_primary = decision_scores[:, _primary_index_for_width(horizon_idx, decision_scores.size(1))]
         ret_primary = targets["ret_mu"][:, _primary_index_for_width(horizon_idx, targets["ret_mu"].size(1))]
         strong_up = ret_primary > 0.03
         if bool(strong_up.any().item()):
             loss_anti_conservative = F.relu(0.2 - decision_primary[strong_up]).mean()
     loss_calibration = outputs["p_win"].new_tensor(0.0)
-    if config.calibration_weight > 0:
+    if float(_config_value(config, "calibration_weight", 0.0)) > 0:
         loss_calibration = torch.abs(
             torch.sigmoid(outputs["p_win"]).mean(dim=0) - targets["p_win"].float().mean(dim=0)
         ).mean()
     loss_p_win_regime = outputs["p_win"].new_tensor(0.0)
     if (
         aux_targets
-        and config.p_win_regime_weight > 0
+        and float(_config_value(config, "p_win_regime_weight", 0.0)) > 0
         and "p_win_regime" in outputs
         and "p_win_rate_by_date" in aux_targets
         and aux_targets["p_win_rate_by_date"].numel() > 0
@@ -755,21 +854,41 @@ def compute_losses(
             outputs["p_win_regime"],
             regime_targets,
         )
+    loss_prediction_entropy = outputs["p_win"].new_tensor(0.0)
+    if float(_config_value(config, "prediction_entropy_weight", 0.0)) > 0:
+        loss_prediction_entropy = _prediction_entropy_loss(
+            outputs,
+            decision_scores,
+            target_std=float(_config_value(config, "prediction_entropy_target_std", 0.06)),
+        )
+    loss_expert_gate_entropy = outputs["p_win"].new_tensor(0.0)
+    if float(_config_value(config, "expert_gate_entropy_weight", 0.0)) > 0:
+        loss_expert_gate_entropy = _expert_gate_entropy_loss(
+            outputs,
+            min_entropy_ratio=float(_config_value(config, "expert_gate_min_entropy_ratio", 0.45)),
+            max_entropy_ratio=float(_config_value(config, "expert_gate_max_entropy_ratio", 0.92)),
+        )
+    loss_expert_gate_prior = outputs["p_win"].new_tensor(0.0)
+    if float(_config_value(config, "expert_gate_prior_weight", 0.0)) > 0:
+        loss_expert_gate_prior = _expert_gate_prior_loss(outputs)
     total = (
-        config.p_win_weight * loss_p_win
-        + config.p_win_brier_weight * loss_p_win_brier
-        + config.p_win_logit_l2_weight * loss_p_win_logit_l2
-        + config.ret_mu_weight * loss_ret_mu
-        + config.ret_sigma_weight * loss_ret_sigma
-        + config.risk_dd_weight * loss_risk_dd
-        + config.bigloss_weight * loss_bigloss
-        + config.upside_weight * loss_upside
-        + config.rank_pairwise_weight * loss_rank_pairwise
-        + config.rank_score_weight * loss_rank_score
-        + config.bigloss_margin_weight * loss_bigloss_margin
-        + config.anti_conservative_weight * loss_anti_conservative
-        + config.calibration_weight * loss_calibration
-        + config.p_win_regime_weight * loss_p_win_regime
+        float(_config_value(config, "p_win_weight", 1.0)) * loss_p_win
+        + float(_config_value(config, "p_win_brier_weight", 0.0)) * loss_p_win_brier
+        + float(_config_value(config, "p_win_logit_l2_weight", 0.0)) * loss_p_win_logit_l2
+        + float(_config_value(config, "ret_mu_weight", 1.0)) * loss_ret_mu
+        + float(_config_value(config, "ret_sigma_weight", 0.0)) * loss_ret_sigma
+        + float(_config_value(config, "risk_dd_weight", 0.0)) * loss_risk_dd
+        + float(_config_value(config, "bigloss_weight", 0.0)) * loss_bigloss
+        + float(_config_value(config, "upside_weight", 0.0)) * loss_upside
+        + float(_config_value(config, "rank_pairwise_weight", 0.0)) * loss_rank_pairwise
+        + float(_config_value(config, "rank_score_weight", 0.0)) * loss_rank_score
+        + float(_config_value(config, "bigloss_margin_weight", 0.0)) * loss_bigloss_margin
+        + float(_config_value(config, "anti_conservative_weight", 0.0)) * loss_anti_conservative
+        + float(_config_value(config, "calibration_weight", 0.0)) * loss_calibration
+        + float(_config_value(config, "p_win_regime_weight", 0.0)) * loss_p_win_regime
+        + float(_config_value(config, "prediction_entropy_weight", 0.0)) * loss_prediction_entropy
+        + float(_config_value(config, "expert_gate_entropy_weight", 0.0)) * loss_expert_gate_entropy
+        + float(_config_value(config, "expert_gate_prior_weight", 0.0)) * loss_expert_gate_prior
     )
     return total, {
         "loss_p_win": loss_p_win,
@@ -786,6 +905,9 @@ def compute_losses(
         "loss_anti_conservative": loss_anti_conservative,
         "loss_calibration": loss_calibration,
         "loss_p_win_regime": loss_p_win_regime,
+        "loss_prediction_entropy": loss_prediction_entropy,
+        "loss_expert_gate_entropy": loss_expert_gate_entropy,
+        "loss_expert_gate_prior": loss_expert_gate_prior,
     }
 
 
@@ -1401,6 +1523,8 @@ def build_model(bundle: DataBundle, config: TrainConfig, device: torch.device) -
 
 def print_split_summary(bundle: DataBundle, config: TrainConfig) -> None:
     test_summary = "test split deferred until final evaluation"
+    if config.merge_test_into_valid:
+        test_summary = "test split merged into validation"
     if bundle.test_split is not None:
         test_summary = f"test rows={bundle.test_split.row_count:,} samples={bundle.test_split.sample_count:,}"
     print("Prepared datasets:")
@@ -1448,7 +1572,8 @@ def main() -> None:
         sampler_recency_power=config.sampler_recency_power,
         sampler_positive_balance_power=config.sampler_positive_balance_power,
         sampler_balance_horizon_index=config.sampler_balance_horizon_index,
-        load_test_split=False,
+        load_test_split=not config.merge_test_into_valid,
+        merge_test_into_valid=config.merge_test_into_valid,
     )
     print_split_summary(bundle, config)
     loss_context = build_loss_context(bundle, device)
@@ -1544,7 +1669,9 @@ def main() -> None:
             f"dd_mae={valid_metrics['risk_dd_mae']:.4f} "
             f"bigloss_loss={valid_metrics['loss_bigloss']:.4f} "
             f"rank_pair={valid_metrics['loss_rank_pairwise']:.4f} "
-            f"regime_loss={valid_metrics['loss_p_win_regime']:.4f}"
+            f"regime_loss={valid_metrics['loss_p_win_regime']:.4f} "
+            f"entropy={valid_metrics['loss_prediction_entropy']:.4f} "
+            f"gate={valid_metrics['loss_expert_gate_entropy']:.4f}"
         )
         print_metric_block("train", train_metrics)
         print_metric_block("valid", valid_metrics)
@@ -1626,29 +1753,32 @@ def main() -> None:
         p_win_thresholds=calibrated_thresholds,
     )
     gc.collect()
-    print("Loading deferred test split for final evaluation...")
-    test_split, test_loader = load_split_for_evaluation(
-        split_name="test",
-        source_path=PROJECT_ROOT / config.test_path,
-        cache_dir=cache_dir,
-        seq_length=config.seq_length,
-        normalizer=bundle.normalizer,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        rebuild_cache=config.rebuild_cache,
-        device_type=device.type,
-    )
-    print(f"Test split ready: rows={test_split.row_count:,} samples={test_split.sample_count:,}")
-    test_metrics_raw = evaluate(model, test_loader, device, config, loss_context, desc="Test")
-    test_metrics = evaluate(
-        model,
-        test_loader,
-        device,
-        config,
-        loss_context,
-        desc="Test calibrated",
-        p_win_thresholds=calibrated_thresholds,
-    )
+    test_metrics_raw: dict[str, Any] = {}
+    test_metrics: dict[str, Any] = {}
+    if not config.merge_test_into_valid:
+        print("Loading deferred test split for final evaluation...")
+        test_split, test_loader = load_split_for_evaluation(
+            split_name="test",
+            source_path=PROJECT_ROOT / config.test_path,
+            cache_dir=cache_dir,
+            seq_length=config.seq_length,
+            normalizer=bundle.normalizer,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            rebuild_cache=config.rebuild_cache,
+            device_type=device.type,
+        )
+        print(f"Test split ready: rows={test_split.row_count:,} samples={test_split.sample_count:,}")
+        test_metrics_raw = evaluate(model, test_loader, device, config, loss_context, desc="Test")
+        test_metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            config,
+            loss_context,
+            desc="Test calibrated",
+            p_win_thresholds=calibrated_thresholds,
+        )
     total_minutes = (time.time() - training_started_at) / 60.0
 
     checkpoint["p_win_thresholds"] = calibrated_thresholds.cpu()
@@ -1656,31 +1786,42 @@ def main() -> None:
     checkpoint["valid_metrics_calibrated"] = best_valid_metrics_calibrated
     checkpoint["test_metrics_raw"] = test_metrics_raw
     checkpoint["test_metrics_calibrated"] = test_metrics
+    checkpoint["test_evaluation_skipped"] = bool(config.merge_test_into_valid)
     torch.save(checkpoint, checkpoint_path)
 
-    save_json(
-        output_dir / "test_metrics.json",
-        {
-            "best_epoch": best_epoch,
-            "best_valid_loss": best_valid_loss,
-            "best_metric_name": best_metric_name,
-            "best_metric_value": best_metric_value,
-            "valid_metrics_raw": best_valid_metrics_raw,
-            "valid_metrics_calibrated": best_valid_metrics_calibrated,
-            "test_metrics_raw": test_metrics_raw,
-            "test_metrics_calibrated": test_metrics,
-            "p_win_thresholds": [float(value) for value in calibrated_thresholds.cpu().tolist()],
-            "train_minutes": total_minutes,
-        },
-    )
-    print(
-        f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} valid_loss={best_valid_loss:.4f} | "
-        f"test_loss={test_metrics['loss']:.4f} test_acc={test_metrics['p_win_acc']:.4f} "
-        f"(raw_acc={test_metrics_raw['p_win_acc']:.4f}) "
-        f"test_ret_mae={test_metrics['ret_mu_mae']:.4f} "
-        f"test_dd_mae={test_metrics['risk_dd_mae']:.4f} "
-        f"test_rank_mae={test_metrics['rank_score_mae']:.4f}"
-    )
+    metrics_payload = {
+        "best_epoch": best_epoch,
+        "best_valid_loss": best_valid_loss,
+        "best_metric_name": best_metric_name,
+        "best_metric_value": best_metric_value,
+        "valid_metrics_raw": best_valid_metrics_raw,
+        "valid_metrics_calibrated": best_valid_metrics_calibrated,
+        "test_metrics_raw": test_metrics_raw,
+        "test_metrics_calibrated": test_metrics,
+        "test_evaluation_skipped": bool(config.merge_test_into_valid),
+        "validation_includes_test": bool(config.merge_test_into_valid),
+        "p_win_thresholds": [float(value) for value in calibrated_thresholds.cpu().tolist()],
+        "train_minutes": total_minutes,
+    }
+    save_json(output_dir / "validation_metrics.json", metrics_payload)
+    save_json(output_dir / "test_metrics.json", metrics_payload)
+    if config.merge_test_into_valid:
+        print(
+            f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} "
+            f"valid_loss={best_valid_loss:.4f} | final validation includes previous test split; "
+            f"valid_acc={best_valid_metrics_calibrated['p_win_acc']:.4f} "
+            f"valid_ret_mae={best_valid_metrics_calibrated['ret_mu_mae']:.4f} "
+            f"valid_dd_mae={best_valid_metrics_calibrated['risk_dd_mae']:.4f}"
+        )
+    else:
+        print(
+            f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} valid_loss={best_valid_loss:.4f} | "
+            f"test_loss={test_metrics['loss']:.4f} test_acc={test_metrics['p_win_acc']:.4f} "
+            f"(raw_acc={test_metrics_raw['p_win_acc']:.4f}) "
+            f"test_ret_mae={test_metrics['ret_mu_mae']:.4f} "
+            f"test_dd_mae={test_metrics['risk_dd_mae']:.4f} "
+            f"test_rank_mae={test_metrics['rank_score_mae']:.4f}"
+        )
     print(f"Artifacts saved to: {output_dir}")
 
 

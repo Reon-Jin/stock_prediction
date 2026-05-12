@@ -322,10 +322,40 @@ class LongTermHorizonExpert(nn.Module):
         return self.output(hidden)
 
 
-class HorizonExpertBank(nn.Module):
-    def __init__(self, input_dim: int, expert_dim: int, dropout: float = 0.1) -> None:
+class HorizonSourceGate(nn.Module):
+    def __init__(self) -> None:
         super().__init__()
         self.horizons = HORIZONS
+        self.source_names = ("seq", "event", "market", "tab", "company", "neighbor")
+        priors = torch.tensor(
+            [
+                [0.40, 0.24, 0.10, 0.10, 0.10, 0.06],
+                [0.36, 0.22, 0.12, 0.12, 0.11, 0.07],
+                [0.30, 0.18, 0.16, 0.14, 0.14, 0.08],
+                [0.22, 0.12, 0.20, 0.20, 0.18, 0.08],
+                [0.18, 0.08, 0.22, 0.20, 0.24, 0.08],
+            ],
+            dtype=torch.float32,
+        )
+        self.register_buffer("source_prior", priors)
+        self.source_logits = nn.Parameter(torch.log(priors.clamp_min(1e-4)))
+
+    def weights(self) -> torch.Tensor:
+        return torch.softmax(self.source_logits, dim=-1)
+
+
+class HorizonExpertBank(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        expert_dim: int,
+        dropout: float = 0.1,
+        source_gate_enabled: bool = False,
+    ) -> None:
+        super().__init__()
+        self.horizons = HORIZONS
+        self.source_gate_enabled = bool(source_gate_enabled)
+        self.source_gate = HorizonSourceGate() if self.source_gate_enabled else None
         self.experts = nn.ModuleDict(
             {
                 str(horizon): (
@@ -342,12 +372,41 @@ class HorizonExpertBank(nn.Module):
         fused: torch.Tensor,
         seq_repr: torch.Tensor,
         context_repr: torch.Tensor,
+        event_repr: torch.Tensor,
+        mkt_repr: torch.Tensor,
         tab_repr: torch.Tensor,
         company_repr: torch.Tensor,
         neighbor_repr: torch.Tensor,
-    ) -> dict[int, torch.Tensor]:
-        expert_input = torch.cat([fused, seq_repr, context_repr, tab_repr, company_repr, neighbor_repr], dim=-1)
-        return {horizon: self.experts[str(horizon)](expert_input) for horizon in self.horizons}
+    ) -> tuple[dict[int, torch.Tensor], torch.Tensor]:
+        if self.source_gate is None:
+            expert_input = torch.cat([fused, seq_repr, context_repr, tab_repr, company_repr, neighbor_repr], dim=-1)
+            empty_weights = fused.new_empty((0, 0))
+            return {horizon: self.experts[str(horizon)](expert_input) for horizon in self.horizons}, empty_weights
+
+        sources = {
+            "seq": seq_repr,
+            "event": event_repr,
+            "market": mkt_repr,
+            "tab": tab_repr,
+            "company": company_repr,
+            "neighbor": neighbor_repr,
+        }
+        weights = self.source_gate.weights().to(device=fused.device, dtype=fused.dtype)
+        scale = float(len(self.source_gate.source_names))
+        expert_reprs: dict[int, torch.Tensor] = {}
+        for horizon_idx, horizon in enumerate(self.horizons):
+            gated_sources = [
+                sources[source_name] * weights[horizon_idx, source_idx] * scale
+                for source_idx, source_name in enumerate(self.source_gate.source_names)
+            ]
+            expert_input = torch.cat([fused, *gated_sources], dim=-1)
+            expert_reprs[horizon] = self.experts[str(horizon)](expert_input)
+        return expert_reprs, weights
+
+    def source_prior(self) -> torch.Tensor:
+        if self.source_gate is None:
+            return torch.empty((0, 0))
+        return self.source_gate.source_prior
 
 
 class HorizonMoEHead(nn.Module):
@@ -532,6 +591,7 @@ class ProfessionalFinancialModel(nn.Module):
         fusion_dim: int = 256,
         task_hidden_dim: int = 128,
         horizon_expert_dim: int = 128,
+        horizon_source_gate: bool = False,
         decision_aux_features: tuple[str, ...] | list[str] | None = None,
         decision_detach_aux: bool = True,
         dropout: float = 0.15,
@@ -595,11 +655,16 @@ class ProfessionalFinancialModel(nn.Module):
             nn.Linear(fusion_dim, fusion_dim),
             nn.GELU(),
         )
-        horizon_expert_input_dim = fusion_dim + seq_output_dim + context_dim + 64 + company_dim + company_dim
+        horizon_expert_input_dim = (
+            fusion_dim + seq_output_dim + 96 + 48 + 64 + company_dim + company_dim
+            if horizon_source_gate
+            else fusion_dim + seq_output_dim + context_dim + 64 + company_dim + company_dim
+        )
         self.horizon_experts = HorizonExpertBank(
             input_dim=horizon_expert_input_dim,
             expert_dim=horizon_expert_dim,
             dropout=dropout,
+            source_gate_enabled=horizon_source_gate,
         )
         self.horizon_heads = nn.ModuleDict()
         self.shared_heads = nn.ModuleDict()
@@ -732,10 +797,12 @@ class ProfessionalFinancialModel(nn.Module):
         for block in self.fusion_blocks:
             fused = block(fused)
         fused = self.shared_out(fused)
-        expert_reprs = self.horizon_experts(
+        expert_reprs, expert_source_weights = self.horizon_experts(
             fused=fused,
             seq_repr=seq_repr,
             context_repr=context_repr,
+            event_repr=event_repr,
+            mkt_repr=mkt_repr,
             tab_repr=tab_repr,
             company_repr=company_repr,
             neighbor_repr=neighbor_repr,
@@ -743,6 +810,8 @@ class ProfessionalFinancialModel(nn.Module):
         outputs = {head_name: head(fused) for head_name, head in self.shared_heads.items()}
         outputs.update({head_name: head(expert_reprs) for head_name, head in self.horizon_heads.items()})
         outputs["event_strength"] = event_strength
+        outputs["expert_source_weights"] = expert_source_weights
+        outputs["expert_source_prior"] = self.horizon_experts.source_prior().to(device=fused.device, dtype=fused.dtype)
         ret_sigma_raw = (
             self.ret_sigma_head(expert_reprs)
             if isinstance(self.ret_sigma_head, HorizonMoEHead)
