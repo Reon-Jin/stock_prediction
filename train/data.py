@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -29,6 +30,7 @@ from datasets.pytorch_dataset import (
     DEFAULT_SEQ_COLUMNS,
     DEFAULT_TAB_COLUMNS,
     EVENT_EMBEDDING_COLUMN,
+    DATA_AUGMENTATION_SOURCE_COLUMNS,
     augment_aligned_features,
 )
 
@@ -75,6 +77,48 @@ def _schema_columns(path: Path) -> set[str]:
 
 def _default_event_source_path(source_path: Path) -> Path:
     return source_path.with_name(f"{source_path.stem}{EVENT_SIDECAR_SUFFIX}")
+
+
+def _merged_validation_source_path(valid_path: Path, test_path: Path, cache_dir: Path) -> Path:
+    signatures = [_source_signature(valid_path), _source_signature(test_path)]
+    digest = hashlib.sha1(json.dumps(signatures, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return cache_dir / f"valid_merged_{digest}.parquet"
+
+
+def materialize_merged_validation_split(valid_path: Path, test_path: Path, cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    merged_path = _merged_validation_source_path(valid_path, test_path, cache_dir)
+    merged_event_path = _default_event_source_path(merged_path)
+    if merged_path.exists():
+        return merged_path
+
+    frames = [pd.read_parquet(path) for path in (valid_path, test_path)]
+    merged = pd.concat(frames, ignore_index=True)
+    if "trade_date" in merged.columns:
+        merged["trade_date"] = pd.to_datetime(merged["trade_date"], errors="coerce")
+        sort_columns = [column for column in ("symbol", "trade_date") if column in merged.columns]
+        if sort_columns:
+            merged = merged.sort_values(sort_columns).reset_index(drop=True)
+    merged.to_parquet(merged_path, index=False)
+
+    event_frames: list[pd.DataFrame] = []
+    for path in (valid_path, test_path):
+        event_path = _default_event_source_path(path)
+        if event_path.exists():
+            event_frames.append(pd.read_parquet(event_path))
+    if event_frames:
+        merged_events = pd.concat(event_frames, ignore_index=True)
+        if "trade_date" in merged_events.columns:
+            merged_events["trade_date"] = pd.to_datetime(merged_events["trade_date"], errors="coerce")
+            merged_events = (
+                merged_events.dropna(subset=["trade_date"])
+                .drop_duplicates(subset=["trade_date"], keep="last")
+                .sort_values("trade_date")
+                .reset_index(drop=True)
+            )
+        merged_events.to_parquet(merged_event_path, index=False)
+
+    return merged_path
 
 
 def _resolve_read_columns(schema_columns: set[str]) -> list[str]:
@@ -542,9 +586,11 @@ class FastStockDataset(Dataset[dict[str, Any]]):
 class DataBundle:
     train_split: PreparedSplit
     valid_split: PreparedSplit
+    test_split: PreparedSplit | None
     normalizer: FeatureNormalizer
     train_loader: DataLoader
     valid_loader: DataLoader
+    test_loader: DataLoader | None
 
 
 def prepare_split(
@@ -760,6 +806,39 @@ def build_loader(
     )
 
 
+def load_split_for_evaluation(
+    split_name: str,
+    source_path: Path,
+    cache_dir: Path,
+    seq_length: int,
+    normalizer: FeatureNormalizer,
+    batch_size: int,
+    num_workers: int | None,
+    rebuild_cache: bool = False,
+    device_type: str = "cpu",
+    pre_normalize_features: bool = False,
+) -> tuple[PreparedSplit, DataLoader]:
+    prepared_split = build_or_load_split(
+        split_name=split_name,
+        source_path=source_path,
+        cache_dir=cache_dir,
+        seq_length=seq_length,
+        rebuild_cache=rebuild_cache,
+    )
+    if pre_normalize_features:
+        _pre_normalize_split_features(prepared_split, normalizer)
+    loader = build_loader(
+        prepared_split=prepared_split,
+        normalizer=normalizer,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device_type=device_type,
+        shuffle=False,
+        normalize_on_the_fly=not pre_normalize_features,
+    )
+    return prepared_split, loader
+
+
 def _pre_normalize_split_features(prepared_split: PreparedSplit, normalizer: FeatureNormalizer) -> None:
     prepared_split.seq_features = normalizer.normalize_seq(prepared_split.seq_features)
     prepared_split.tab_features = normalizer.normalize_tab(prepared_split.tab_features)
@@ -816,6 +895,7 @@ def build_weighted_train_sampler(
 def build_data_bundle(
     train_path: Path,
     valid_path: Path,
+    test_path: Path,
     cache_dir: Path,
     seq_length: int,
     batch_size: int,
@@ -826,15 +906,28 @@ def build_data_bundle(
     sampler_recency_power: float = 1.5,
     sampler_positive_balance_power: float = 0.5,
     sampler_balance_horizon_index: int = 1,
+    load_test_split: bool = True,
+    merge_test_into_valid: bool = False,
     pre_normalize_features: bool = False,
 ) -> DataBundle:
     train_split = build_or_load_split("train", train_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
     normalizer = FeatureNormalizer.fit(train_split)
-    valid_split = build_or_load_split("valid", valid_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
+    valid_source_path = valid_path
+    valid_split_name = "valid"
+    if merge_test_into_valid and test_path.exists():
+        valid_source_path = materialize_merged_validation_split(valid_path, test_path, cache_dir)
+        valid_split_name = "valid_merged"
+    valid_split = build_or_load_split(valid_split_name, valid_source_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
+    test_split = None
+    test_loader = None
+    if load_test_split and not merge_test_into_valid:
+        test_split = build_or_load_split("test", test_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
 
     if pre_normalize_features:
         _pre_normalize_split_features(train_split, normalizer)
         _pre_normalize_split_features(valid_split, normalizer)
+        if test_split is not None:
+            _pre_normalize_split_features(test_split, normalizer)
 
     train_sampler = None
     if use_weighted_sampler:
@@ -848,6 +941,7 @@ def build_data_bundle(
     return DataBundle(
         train_split=train_split,
         valid_split=valid_split,
+        test_split=test_split,
         normalizer=normalizer,
         train_loader=build_loader(
             prepared_split=train_split,
@@ -867,5 +961,18 @@ def build_data_bundle(
             device_type=device_type,
             shuffle=False,
             normalize_on_the_fly=not pre_normalize_features,
+        ),
+        test_loader=(
+            build_loader(
+                prepared_split=test_split,
+                normalizer=normalizer,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                device_type=device_type,
+                shuffle=False,
+                normalize_on_the_fly=not pre_normalize_features,
+            )
+            if test_split is not None
+            else None
         ),
     )
