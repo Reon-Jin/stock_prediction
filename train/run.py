@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from train.data import DataBundle, build_data_bundle, load_split_for_evaluation
+from train.data import DataBundle, build_data_bundle
 from train.model import BIGLOSS_HORIZONS, BIGLOSS_PROXY_BY_HORIZON, HORIZONS, TinyMultiInputModel
 from train.visualization import plot_business_history, plot_topk_metrics, plot_training_history
 
@@ -55,7 +55,6 @@ LOSS_PART_NAMES = (
 class TrainConfig:
     train_path: str
     valid_path: str
-    test_path: str
     output_dir: str
     cache_dir: str
     seq_length: int
@@ -72,6 +71,7 @@ class TrainConfig:
     company_dim: int
     fusion_dim: int
     task_hidden_dim: int
+    horizon_expert_dim: int
     grad_clip: float
     early_stop_patience: int
     num_workers: int | None
@@ -113,10 +113,10 @@ class TrainConfig:
     expert_gate_min_entropy_ratio: float
     expert_gate_max_entropy_ratio: float
     expert_gate_prior_weight: float
-    merge_test_into_valid: bool
     primary_horizon_index: int
     topk: int
     best_model_metric: str
+    early_stop_min_delta: float
     max_train_batches: int | None
     max_eval_batches: int | None
     amp_dtype: str
@@ -145,50 +145,51 @@ def recommended_batch_size(device_name: str) -> int:
         print("Using CPU")
         return 128
     print("Using GPU")
-    return 2048
+    return 4096
 
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train a professional multi-input financial prediction model.")
     parser.add_argument("--train-path", type=str, default="data/exports/train.parquet")
     parser.add_argument("--valid-path", type=str, default="data/exports/valid.parquet")
-    parser.add_argument("--test-path", type=str, default="data/exports/test.parquet")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="train/cache")
-    parser.add_argument("--seq-length", type=int, default=60)
+    parser.add_argument("--seq-length", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--seq-model-dim", type=int, default=96)
-    parser.add_argument("--seq-output-dim", type=int, default=128)
+    parser.add_argument("--weight-decay", type=float, default=3e-3)
+    parser.add_argument("--dropout", type=float, default=0.35)
+    parser.add_argument("--seq-model-dim", type=int, default=88)
+    parser.add_argument("--seq-output-dim", type=int, default=120)
     parser.add_argument("--seq-attn-heads", type=int, default=4)
-    parser.add_argument("--branch-hidden-dim", type=int, default=192)
-    parser.add_argument("--context-dim", type=int, default=96)
-    parser.add_argument("--company-dim", type=int, default=48)
-    parser.add_argument("--fusion-dim", type=int, default=256)
-    parser.add_argument("--task-hidden-dim", type=int, default=128)
+    parser.add_argument("--branch-hidden-dim", type=int, default=120)
+    parser.add_argument("--context-dim", type=int, default=80)
+    parser.add_argument("--company-dim", type=int, default=44)
+    parser.add_argument("--fusion-dim", type=int, default=184)
+    parser.add_argument("--task-hidden-dim", type=int, default=96)
+    parser.add_argument("--horizon-expert-dim", type=int, default=120)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--label-smoothing", type=float, default=0.02)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--min-lr-ratio", type=float, default=0.15)
     parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--use-amp", action="store_true", help="Enable CUDA autocast; float32 is the default.")
     parser.add_argument("--focal-gamma", type=float, default=0.25)
     parser.add_argument("--p-win-brier-weight", type=float, default=0.05)
-    parser.add_argument("--p-win-logit-l2-weight", type=float, default=1e-4)
+    parser.add_argument("--p-win-logit-l2-weight", type=float, default=3e-4)
     parser.add_argument("--no-decision-detach-aux", action="store_true")
     parser.add_argument("--disable-horizon-source-gate", action="store_true")
     parser.add_argument("--diagnostic-eval-batches", type=int, default=2)
-    parser.add_argument("--disable-weighted-sampler", action="store_true")
-    parser.add_argument("--sampler-recency-power", type=float, default=1.5)
-    parser.add_argument("--sampler-positive-balance-power", type=float, default=0.5)
+    parser.add_argument("--enable-weighted-sampler", action="store_true")
+    parser.add_argument("--disable-weighted-sampler", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--sampler-recency-power", type=float, default=0.75)
+    parser.add_argument("--sampler-positive-balance-power", type=float, default=0.25)
     parser.add_argument("--sampler-balance-horizon-index", type=int, default=1)
     parser.add_argument("--p-win-weight", type=float, default=0.9)
     parser.add_argument("--ret-mu-weight", type=float, default=1.0)
@@ -196,7 +197,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--risk-dd-weight", type=float, default=0.1)
     parser.add_argument("--bigloss-weight", type=float, default=0.05)
     parser.add_argument("--upside-weight", type=float, default=0.05)
-    parser.add_argument("--rank-pairwise-weight", type=float, default=1.0)
+    parser.add_argument("--rank-pairwise-weight", type=float, default=0.5)
     parser.add_argument("--rank-score-weight", type=float, default=0.0)
     parser.add_argument("--bigloss-margin-weight", type=float, default=0.0)
     parser.add_argument("--anti-conservative-weight", type=float, default=0.0)
@@ -210,14 +211,25 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--expert-gate-min-entropy-ratio", type=float, default=0.45)
     parser.add_argument("--expert-gate-max-entropy-ratio", type=float, default=0.92)
     parser.add_argument("--expert-gate-prior-weight", type=float, default=0.005)
-    parser.add_argument("--keep-test-split", action="store_true")
     parser.add_argument("--primary-horizon-index", type=int, default=2, help="0-based main horizon; default 2 means 10d.")
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument(
         "--best-model-metric",
         type=str,
-        default="valid_business_score",
-        choices=["valid_loss", "valid_p_win_acc", "valid_business_score", "valid_topk_utility"],
+        default="valid_loss",
+        choices=[
+            "valid_loss",
+            "valid_p_win_acc",
+            "valid_p_win_bal_acc",
+            "valid_business_score",
+            "valid_topk_utility",
+        ],
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum absolute validation improvement required to reset early stopping patience.",
     )
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
@@ -242,7 +254,6 @@ def parse_args() -> TrainConfig:
     return TrainConfig(
         train_path=args.train_path,
         valid_path=args.valid_path,
-        test_path=args.test_path,
         output_dir=output_dir,
         cache_dir=args.cache_dir,
         seq_length=args.seq_length,
@@ -259,6 +270,7 @@ def parse_args() -> TrainConfig:
         company_dim=args.company_dim,
         fusion_dim=args.fusion_dim,
         task_hidden_dim=args.task_hidden_dim,
+        horizon_expert_dim=args.horizon_expert_dim,
         grad_clip=args.grad_clip,
         early_stop_patience=args.early_stop_patience,
         num_workers=args.num_workers,
@@ -276,7 +288,7 @@ def parse_args() -> TrainConfig:
         decision_detach_aux=not args.no_decision_detach_aux,
         horizon_source_gate=not args.disable_horizon_source_gate,
         diagnostic_eval_batches=args.diagnostic_eval_batches,
-        use_weighted_sampler=not args.disable_weighted_sampler,
+        use_weighted_sampler=bool(args.enable_weighted_sampler and not args.disable_weighted_sampler),
         sampler_recency_power=args.sampler_recency_power,
         sampler_positive_balance_power=args.sampler_positive_balance_power,
         sampler_balance_horizon_index=args.sampler_balance_horizon_index,
@@ -300,10 +312,10 @@ def parse_args() -> TrainConfig:
         expert_gate_min_entropy_ratio=args.expert_gate_min_entropy_ratio,
         expert_gate_max_entropy_ratio=args.expert_gate_max_entropy_ratio,
         expert_gate_prior_weight=args.expert_gate_prior_weight,
-        merge_test_into_valid=not args.keep_test_split,
         primary_horizon_index=args.primary_horizon_index,
         topk=args.topk,
         best_model_metric=args.best_model_metric,
+        early_stop_min_delta=args.early_stop_min_delta,
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
         amp_dtype=args.amp_dtype,
@@ -400,6 +412,7 @@ def build_model_kwargs(config: TrainConfig) -> dict[str, Any]:
         "company_dim": config.company_dim,
         "fusion_dim": config.fusion_dim,
         "task_hidden_dim": config.task_hidden_dim,
+        "horizon_expert_dim": config.horizon_expert_dim,
         "horizon_source_gate": config.horizon_source_gate,
         "decision_aux_features": decision_aux_features_from_config(config),
         "decision_detach_aux": config.decision_detach_aux,
@@ -1183,10 +1196,15 @@ def _finalize_metrics(running: dict[str, Any]) -> dict[str, Any]:
     topk_metrics = _compute_topk_metrics_from_chunks(running)
     primary_idx = _primary_index_for_width(int(running.get("primary_horizon_index", 2)), len(p_win_bal_acc_by_head))
     primary_bal_acc = float(p_win_bal_acc_by_head[primary_idx].item()) if len(p_win_bal_acc_by_head) else 0.0
+    primary_majority_baseline = (
+        float(p_win_majority_baseline_by_head[primary_idx].item()) if len(p_win_majority_baseline_by_head) else 0.0
+    )
     topk_metrics["business_score"] = float(topk_metrics.get("topk_utility", 0.0)) + 0.1 * primary_bal_acc
     metrics = {
         "loss": running["loss_sum"] / max(1.0, running["sample_count"]),
         "p_win_acc": running["p_win_correct"] / max(1.0, running["p_win_total"]),
+        "p_win_bal_acc": primary_bal_acc,
+        "p_win_majority_baseline": primary_majority_baseline,
         "ret_mu_mae": running["ret_mu_abs"] / max(1.0, running["ret_mu_total"]),
         "risk_dd_mae": running["risk_dd_abs"] / max(1.0, running["risk_dd_total"]),
         "rank_score_mae": running["rank_score_abs"] / max(1.0, running["rank_score_total"]),
@@ -1218,6 +1236,8 @@ def flatten_metrics_for_history(prefix: str, metrics: dict[str, Any]) -> dict[st
     scalar_keys = (
         "loss",
         "p_win_acc",
+        "p_win_bal_acc",
+        "p_win_majority_baseline",
         "ret_mu_mae",
         "risk_dd_mae",
         "rank_score_mae",
@@ -1635,16 +1655,10 @@ def build_model(bundle: DataBundle, config: TrainConfig, device: torch.device) -
 
 
 def print_split_summary(bundle: DataBundle, config: TrainConfig) -> None:
-    test_summary = "test split deferred until final evaluation"
-    if config.merge_test_into_valid:
-        test_summary = "test split merged into validation"
-    if bundle.test_split is not None:
-        test_summary = f"test rows={bundle.test_split.row_count:,} samples={bundle.test_split.sample_count:,}"
     print("Prepared datasets:")
     print(
         f"  train rows={bundle.train_split.row_count:,} samples={bundle.train_split.sample_count:,} "
-        f"valid rows={bundle.valid_split.row_count:,} samples={bundle.valid_split.sample_count:,} "
-        f"{test_summary}"
+        f"valid rows={bundle.valid_split.row_count:,} samples={bundle.valid_split.sample_count:,}"
     )
     print(
         f"  dims: seq={bundle.train_split.input_dims['f_seq']} "
@@ -1656,8 +1670,34 @@ def print_split_summary(bundle: DataBundle, config: TrainConfig) -> None:
     print(f"  device={config.device} batch_size={config.batch_size} epochs={config.epochs}")
     print(
         f"  model: seq_model_dim={config.seq_model_dim} seq_output_dim={config.seq_output_dim} "
-        f"fusion_dim={config.fusion_dim} task_hidden_dim={config.task_hidden_dim}"
+        f"fusion_dim={config.fusion_dim} task_hidden_dim={config.task_hidden_dim} "
+        f"horizon_expert_dim={config.horizon_expert_dim}"
     )
+
+
+def print_data_contract_warnings(bundle: DataBundle, config: TrainConfig) -> None:
+    summary_path = (PROJECT_ROOT / config.valid_path).parent / "split_summary.json"
+    if summary_path.exists():
+        try:
+            split_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            split_summary = {}
+        export_seq_length = split_summary.get("seq_length")
+        if export_seq_length is not None and int(export_seq_length) != int(config.seq_length):
+            print(
+                "WARNING: training --seq-length does not match exported split_summary seq_length "
+                f"({config.seq_length} vs {export_seq_length}). Re-export the split or use --seq-length {export_seq_length} "
+                "for a cleaner validation window."
+            )
+    if bundle.valid_split.sample_count <= 0:
+        raise ValueError("validation split produced zero samples; reduce --seq-length or rebuild exports.")
+    sample_ratio = bundle.valid_split.sample_count / max(1, bundle.valid_split.row_count)
+    if sample_ratio < 0.10:
+        print(
+            "WARNING: validation sample_count is very small relative to rows "
+            f"({bundle.valid_split.sample_count:,}/{bundle.valid_split.row_count:,}). "
+            "Validation metrics may be dominated by only the last few dates."
+        )
 
 
 def main() -> None:
@@ -1674,7 +1714,6 @@ def main() -> None:
     bundle = build_data_bundle(
         train_path=PROJECT_ROOT / config.train_path,
         valid_path=PROJECT_ROOT / config.valid_path,
-        test_path=PROJECT_ROOT / config.test_path,
         cache_dir=cache_dir,
         seq_length=config.seq_length,
         batch_size=config.batch_size,
@@ -1685,11 +1724,10 @@ def main() -> None:
         sampler_recency_power=config.sampler_recency_power,
         sampler_positive_balance_power=config.sampler_positive_balance_power,
         sampler_balance_horizon_index=config.sampler_balance_horizon_index,
-        load_test_split=not config.merge_test_into_valid,
-        merge_test_into_valid=config.merge_test_into_valid,
         pre_normalize_features=config.pre_normalize_features,
     )
     print_split_summary(bundle, config)
+    print_data_contract_warnings(bundle, config)
     loss_context = build_loss_context(bundle, device)
 
     model = build_model(bundle, config, device)
@@ -1701,7 +1739,8 @@ def main() -> None:
     history: list[dict[str, float]] = []
     best_valid_loss = float("inf")
     best_metric_name = str(config.best_model_metric)
-    if best_metric_name in {"valid_p_win_acc", "valid_business_score", "valid_topk_utility"}:
+    max_metric_names = {"valid_p_win_acc", "valid_p_win_bal_acc", "valid_business_score", "valid_topk_utility"}
+    if best_metric_name in max_metric_names:
         best_metric_value = float("-inf")
     else:
         best_metric_value = float("inf")
@@ -1765,6 +1804,11 @@ def main() -> None:
             **flatten_metrics_for_history("valid_ema", valid_ema_metrics),
             **flatten_metrics_for_history("valid", valid_metrics),
         }
+        record["generalization_loss_gap"] = float(valid_metrics["loss"] - train_metrics["loss"])
+        record["generalization_p_win_acc_gap"] = float(train_metrics["p_win_acc"] - valid_metrics["p_win_acc"])
+        record["generalization_p_win_bal_acc_gap"] = float(
+            train_metrics["p_win_bal_acc"] - valid_metrics["p_win_bal_acc"]
+        )
         history.append(record)
         save_history_csv(output_dir / "history.csv", history)
         save_json(output_dir / "history.json", {"epochs": history})
@@ -1777,6 +1821,8 @@ def main() -> None:
             f"train_loss={train_metrics['loss']:.4f} valid_loss={valid_metrics['loss']:.4f} "
             f"valid_live_loss={valid_live_metrics['loss']:.4f} "
             f"valid_acc={valid_metrics['p_win_acc']:.4f} "
+            f"valid_bal_acc={valid_metrics['p_win_bal_acc']:.4f} "
+            f"valid_majority={valid_metrics['p_win_majority_baseline']:.4f} "
             f"valid_business={valid_metrics['business_score']:.4f} "
             f"topk_util={valid_metrics['topk_utility']:.4f} "
             f"ret_mae={valid_metrics['ret_mu_mae']:.4f} "
@@ -1812,16 +1858,19 @@ def main() -> None:
 
         if best_metric_name == "valid_p_win_acc":
             current_metric_value = float(valid_metrics["p_win_acc"])
+        elif best_metric_name == "valid_p_win_bal_acc":
+            current_metric_value = float(valid_metrics["p_win_bal_acc"])
         elif best_metric_name == "valid_business_score":
             current_metric_value = float(valid_metrics["business_score"])
         elif best_metric_name == "valid_topk_utility":
             current_metric_value = float(valid_metrics["topk_utility"])
         else:
             current_metric_value = float(valid_metrics["loss"])
+        min_delta = max(0.0, float(config.early_stop_min_delta))
         is_improved = (
-            current_metric_value > best_metric_value
-            if best_metric_name in {"valid_p_win_acc", "valid_business_score", "valid_topk_utility"}
-            else current_metric_value < best_metric_value
+            current_metric_value > best_metric_value + min_delta
+            if best_metric_name in max_metric_names
+            else current_metric_value < best_metric_value - min_delta
         )
 
         if is_improved:
@@ -1868,41 +1917,11 @@ def main() -> None:
         p_win_thresholds=calibrated_thresholds,
     )
     gc.collect()
-    test_metrics_raw: dict[str, Any] = {}
-    test_metrics: dict[str, Any] = {}
-    if not config.merge_test_into_valid:
-        print("Loading deferred test split for final evaluation...")
-        test_split, test_loader = load_split_for_evaluation(
-            split_name="test",
-            source_path=PROJECT_ROOT / config.test_path,
-            cache_dir=cache_dir,
-            seq_length=config.seq_length,
-            normalizer=bundle.normalizer,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            rebuild_cache=config.rebuild_cache,
-            device_type=device.type,
-            pre_normalize_features=config.pre_normalize_features,
-        )
-        print(f"Test split ready: rows={test_split.row_count:,} samples={test_split.sample_count:,}")
-        test_metrics_raw = evaluate(model, test_loader, device, config, loss_context, desc="Test")
-        test_metrics = evaluate(
-            model,
-            test_loader,
-            device,
-            config,
-            loss_context,
-            desc="Test calibrated",
-            p_win_thresholds=calibrated_thresholds,
-        )
     total_minutes = (time.time() - training_started_at) / 60.0
 
     checkpoint["p_win_thresholds"] = calibrated_thresholds.cpu()
     checkpoint["valid_metrics_raw"] = best_valid_metrics_raw
     checkpoint["valid_metrics_calibrated"] = best_valid_metrics_calibrated
-    checkpoint["test_metrics_raw"] = test_metrics_raw
-    checkpoint["test_metrics_calibrated"] = test_metrics
-    checkpoint["test_evaluation_skipped"] = bool(config.merge_test_into_valid)
     torch.save(checkpoint, checkpoint_path)
 
     metrics_payload = {
@@ -1912,32 +1931,17 @@ def main() -> None:
         "best_metric_value": best_metric_value,
         "valid_metrics_raw": best_valid_metrics_raw,
         "valid_metrics_calibrated": best_valid_metrics_calibrated,
-        "test_metrics_raw": test_metrics_raw,
-        "test_metrics_calibrated": test_metrics,
-        "test_evaluation_skipped": bool(config.merge_test_into_valid),
-        "validation_includes_test": bool(config.merge_test_into_valid),
         "p_win_thresholds": [float(value) for value in calibrated_thresholds.cpu().tolist()],
         "train_minutes": total_minutes,
     }
     save_json(output_dir / "validation_metrics.json", metrics_payload)
-    save_json(output_dir / "test_metrics.json", metrics_payload)
-    if config.merge_test_into_valid:
-        print(
-            f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} "
-            f"valid_loss={best_valid_loss:.4f} | final validation includes previous test split; "
-            f"valid_acc={best_valid_metrics_calibrated['p_win_acc']:.4f} "
-            f"valid_ret_mae={best_valid_metrics_calibrated['ret_mu_mae']:.4f} "
-            f"valid_dd_mae={best_valid_metrics_calibrated['risk_dd_mae']:.4f}"
-        )
-    else:
-        print(
-            f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} valid_loss={best_valid_loss:.4f} | "
-            f"test_loss={test_metrics['loss']:.4f} test_acc={test_metrics['p_win_acc']:.4f} "
-            f"(raw_acc={test_metrics_raw['p_win_acc']:.4f}) "
-            f"test_ret_mae={test_metrics['ret_mu_mae']:.4f} "
-            f"test_dd_mae={test_metrics['risk_dd_mae']:.4f} "
-            f"test_rank_mae={test_metrics['rank_score_mae']:.4f}"
-        )
+    print(
+        f"Best epoch={best_epoch} {best_metric_name}={best_metric_value:.4f} "
+        f"valid_loss={best_valid_loss:.4f} | "
+        f"valid_acc={best_valid_metrics_calibrated['p_win_acc']:.4f} "
+        f"valid_ret_mae={best_valid_metrics_calibrated['ret_mu_mae']:.4f} "
+        f"valid_dd_mae={best_valid_metrics_calibrated['risk_dd_mae']:.4f}"
+    )
     print(f"Artifacts saved to: {output_dir}")
 
 
