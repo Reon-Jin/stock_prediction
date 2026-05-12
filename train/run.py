@@ -119,6 +119,8 @@ class TrainConfig:
     best_model_metric: str
     max_train_batches: int | None
     max_eval_batches: int | None
+    amp_dtype: str
+    pre_normalize_features: bool
     disable_tqdm: bool
 
 
@@ -219,6 +221,18 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bfloat16", "float16"],
+        help="CUDA autocast dtype when --use-amp is enabled. auto prefers bfloat16 when available.",
+    )
+    parser.add_argument(
+        "--pre-normalize-features",
+        action="store_true",
+        help="Normalize cached split tensors once at load time instead of per sample.",
+    )
     parser.add_argument("--disable-tqdm", action="store_true")
     args = parser.parse_args()
 
@@ -292,6 +306,8 @@ def parse_args() -> TrainConfig:
         best_model_metric=args.best_model_metric,
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
+        amp_dtype=args.amp_dtype,
+        pre_normalize_features=args.pre_normalize_features,
         disable_tqdm=args.disable_tqdm,
     )
 
@@ -314,7 +330,13 @@ def autocast_config(device: torch.device, config: TrainConfig) -> tuple[bool, to
     enabled = bool(config.use_amp and device.type == "cuda")
     if not enabled:
         return False, torch.float32
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    requested_dtype = str(_config_value(config, "amp_dtype", "auto"))
+    if requested_dtype == "bfloat16":
+        dtype = torch.bfloat16
+    elif requested_dtype == "float16":
+        dtype = torch.float16
+    else:
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return True, dtype
 
 
@@ -911,6 +933,60 @@ def compute_losses(
     }
 
 
+def _float_loss_tensors(values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        name: value.float() if torch.is_tensor(value) and value.is_floating_point() else value
+        for name, value in values.items()
+    }
+
+
+def _finite_tensor_dict(values: dict[str, torch.Tensor], names: tuple[str, ...]) -> tuple[bool, str]:
+    for name in names:
+        value = values.get(name)
+        if value is not None and torch.is_tensor(value) and value.is_floating_point():
+            if not torch.isfinite(value).all():
+                return False, name
+    return True, ""
+
+
+def _first_nonfinite_parameter(model: nn.Module) -> str | None:
+    for name, parameter in model.named_parameters():
+        if parameter.is_floating_point() and not torch.isfinite(parameter).all():
+            return name
+    return None
+
+
+def _optimizer_step_with_finite_grads(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    grad_clip: float,
+) -> tuple[bool, float]:
+    try:
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            grad_clip,
+            error_if_nonfinite=True,
+        )
+    except RuntimeError as exc:
+        if "non-finite" not in str(exc).lower():
+            raise
+        optimizer.zero_grad(set_to_none=True)
+        scaler.update()
+        return False, float("nan")
+
+    grad_norm_value = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
+    if not np.isfinite(grad_norm_value):
+        optimizer.zero_grad(set_to_none=True)
+        scaler.update()
+        return False, grad_norm_value
+
+    scaler.step(optimizer)
+    scaler.update()
+    return True, grad_norm_value
+
+
 def _safe_tensor_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
     safe_denominator = denominator.clamp_min(1.0)
     ratio = numerator / safe_denominator
@@ -1030,6 +1106,9 @@ def _init_running_totals(
     return {
         "loss_sum": 0.0,
         "sample_count": 0.0,
+        "skipped_batches": 0.0,
+        "grad_norm_sum": 0.0,
+        "grad_norm_count": 0.0,
         "topk": int(topk),
         "primary_horizon_index": int(primary_horizon_index),
         "p_win_correct": 0.0,
@@ -1111,6 +1190,8 @@ def _finalize_metrics(running: dict[str, Any]) -> dict[str, Any]:
         "ret_mu_mae": running["ret_mu_abs"] / max(1.0, running["ret_mu_total"]),
         "risk_dd_mae": running["risk_dd_abs"] / max(1.0, running["risk_dd_total"]),
         "rank_score_mae": running["rank_score_abs"] / max(1.0, running["rank_score_total"]),
+        "skipped_batches": running.get("skipped_batches", 0.0),
+        "grad_norm": running.get("grad_norm_sum", 0.0) / max(1.0, running.get("grad_norm_count", 0.0)),
         "p_win_acc_by_head": [float(value) for value in p_win_acc_by_head.tolist()],
         "p_win_bal_acc_by_head": [float(value) for value in p_win_bal_acc_by_head.tolist()],
         "p_win_target_pos_rate_by_head": [float(value) for value in p_win_target_pos_rate_by_head.tolist()],
@@ -1140,6 +1221,8 @@ def flatten_metrics_for_history(prefix: str, metrics: dict[str, Any]) -> dict[st
         "ret_mu_mae",
         "risk_dd_mae",
         "rank_score_mae",
+        "skipped_batches",
+        "grad_norm",
         "topk_utility",
         "business_score",
         *LOSS_PART_NAMES,
@@ -1345,16 +1428,46 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled):
             outputs = model(batch)
-            loss, parts = compute_losses(outputs, batch["y"], config, loss_context, aux_targets=batch.get("aux"))
+        outputs_for_loss = _float_loss_tensors(outputs)
+        finite_outputs, bad_output = _finite_tensor_dict(
+            outputs_for_loss,
+            ("p_win", "ret_mu", "risk_dd", "bigloss", "rank_score", "decision_score"),
+        )
+        if not finite_outputs:
+            running["skipped_batches"] += 1.0
+            progress.set_postfix(skip=f"nonfinite:{bad_output}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            continue
+
+        loss, parts = compute_losses(
+            outputs_for_loss,
+            _float_loss_tensors(batch["y"]),
+            config,
+            loss_context,
+            aux_targets=batch.get("aux"),
+        )
+        if not torch.isfinite(loss):
+            running["skipped_batches"] += 1.0
+            optimizer.zero_grad(set_to_none=True)
+            progress.set_postfix(skip="nonfinite:loss", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            continue
+
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        step_applied, grad_norm = _optimizer_step_with_finite_grads(model, optimizer, scaler, config.grad_clip)
+        if not step_applied:
+            running["skipped_batches"] += 1.0
+            progress.set_postfix(skip="nonfinite:grad", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            continue
+        running["grad_norm_sum"] += grad_norm
+        running["grad_norm_count"] += 1.0
+
+        bad_parameter = _first_nonfinite_parameter(model)
+        if bad_parameter is not None:
+            raise RuntimeError(f"Non-finite model parameter after optimizer step: {bad_parameter}")
+
         if ema is not None:
             ema.update(model)
 
-        _update_metrics_from_batch(running, batch, outputs, loss, parts, p_win_thresholds)
+        _update_metrics_from_batch(running, batch, outputs_for_loss, loss, parts, p_win_thresholds)
 
         metrics = _finalize_metrics(running)
         progress.set_postfix(
@@ -1574,6 +1687,7 @@ def main() -> None:
         sampler_balance_horizon_index=config.sampler_balance_horizon_index,
         load_test_split=not config.merge_test_into_valid,
         merge_test_into_valid=config.merge_test_into_valid,
+        pre_normalize_features=config.pre_normalize_features,
     )
     print_split_summary(bundle, config)
     loss_context = build_loss_context(bundle, device)
@@ -1671,7 +1785,8 @@ def main() -> None:
             f"rank_pair={valid_metrics['loss_rank_pairwise']:.4f} "
             f"regime_loss={valid_metrics['loss_p_win_regime']:.4f} "
             f"entropy={valid_metrics['loss_prediction_entropy']:.4f} "
-            f"gate={valid_metrics['loss_expert_gate_entropy']:.4f}"
+            f"gate={valid_metrics['loss_expert_gate_entropy']:.4f} "
+            f"skipped={train_metrics['skipped_batches']:.0f}"
         )
         print_metric_block("train", train_metrics)
         print_metric_block("valid", valid_metrics)
@@ -1767,6 +1882,7 @@ def main() -> None:
             num_workers=config.num_workers,
             rebuild_cache=config.rebuild_cache,
             device_type=device.type,
+            pre_normalize_features=config.pre_normalize_features,
         )
         print(f"Test split ready: rows={test_split.row_count:,} samples={test_split.sample_count:,}")
         test_metrics_raw = evaluate(model, test_loader, device, config, loss_context, desc="Test")

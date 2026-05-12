@@ -531,9 +531,25 @@ class FeatureNormalizer:
 
 
 class FastStockDataset(Dataset[dict[str, Any]]):
-    def __init__(self, prepared: PreparedSplit, normalizer: FeatureNormalizer):
+    def __init__(self, prepared: PreparedSplit, normalizer: FeatureNormalizer, normalize_on_the_fly: bool = True):
         self.prepared = prepared
         self.normalizer = normalizer
+        self.normalize_on_the_fly = bool(normalize_on_the_fly)
+
+    def _feature(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        if not self.normalize_on_the_fly:
+            return value
+        if name == "seq":
+            return self.normalizer.normalize_seq(value)
+        if name == "tab":
+            return self.normalizer.normalize_tab(value)
+        if name == "event":
+            return self.normalizer.normalize_event(value)
+        if name == "mkt":
+            return self.normalizer.normalize_mkt(value)
+        if name == "profile":
+            return self.normalizer.normalize_profile(value)
+        return value
 
     def __len__(self) -> int:
         return self.prepared.sample_count
@@ -543,14 +559,14 @@ class FastStockDataset(Dataset[dict[str, Any]]):
         start_idx = int(self.prepared.sample_start_indices[index].item())
         date_idx = int(self.prepared.row_to_date_idx[row_idx].item())
         return {
-            "X_seq": self.normalizer.normalize_seq(self.prepared.seq_features[start_idx : row_idx + 1]),
-            "X_tab": self.normalizer.normalize_tab(self.prepared.tab_features[row_idx]),
-            "X_event": self.normalizer.normalize_event(self.prepared.event_by_date[date_idx]),
-            "X_mkt": self.normalizer.normalize_mkt(self.prepared.mkt_by_date[date_idx]),
+            "X_seq": self._feature("seq", self.prepared.seq_features[start_idx : row_idx + 1]),
+            "X_tab": self._feature("tab", self.prepared.tab_features[row_idx]),
+            "X_event": self._feature("event", self.prepared.event_by_date[date_idx]),
+            "X_mkt": self._feature("mkt", self.prepared.mkt_by_date[date_idx]),
             "X_company_ids": {
                 key: value[row_idx] for key, value in self.prepared.company_ids.items()
             },
-            "X_company_profile": self.normalizer.normalize_profile(self.prepared.company_profile_features[row_idx]),
+            "X_company_profile": self._feature("profile", self.prepared.company_profile_features[row_idx]),
             "neighbors": {
                 "neighbor_symbol_ids": self.prepared.neighbor_symbol_ids[row_idx],
                 "neighbor_scores": self.prepared.neighbor_scores[row_idx],
@@ -768,6 +784,7 @@ def build_loader(
     device_type: str = "cpu",
     shuffle: bool = False,
     sampler: WeightedRandomSampler | None = None,
+    normalize_on_the_fly: bool = True,
 ) -> DataLoader:
     workers = resolve_num_workers(num_workers)
     pin_memory = device_type == "cuda"
@@ -779,7 +796,7 @@ def build_loader(
     }
     if workers > 0:
         loader_kwargs["prefetch_factor"] = 2
-    dataset = FastStockDataset(prepared_split, normalizer)
+    dataset = FastStockDataset(prepared_split, normalizer, normalize_on_the_fly=normalize_on_the_fly)
     return DataLoader(
         dataset,
         shuffle=shuffle and sampler is None,
@@ -799,6 +816,7 @@ def load_split_for_evaluation(
     num_workers: int | None,
     rebuild_cache: bool = False,
     device_type: str = "cpu",
+    pre_normalize_features: bool = False,
 ) -> tuple[PreparedSplit, DataLoader]:
     prepared_split = build_or_load_split(
         split_name=split_name,
@@ -807,6 +825,8 @@ def load_split_for_evaluation(
         seq_length=seq_length,
         rebuild_cache=rebuild_cache,
     )
+    if pre_normalize_features:
+        _pre_normalize_split_features(prepared_split, normalizer)
     loader = build_loader(
         prepared_split=prepared_split,
         normalizer=normalizer,
@@ -814,8 +834,17 @@ def load_split_for_evaluation(
         num_workers=num_workers,
         device_type=device_type,
         shuffle=False,
+        normalize_on_the_fly=not pre_normalize_features,
     )
     return prepared_split, loader
+
+
+def _pre_normalize_split_features(prepared_split: PreparedSplit, normalizer: FeatureNormalizer) -> None:
+    prepared_split.seq_features = normalizer.normalize_seq(prepared_split.seq_features)
+    prepared_split.tab_features = normalizer.normalize_tab(prepared_split.tab_features)
+    prepared_split.event_by_date = normalizer.normalize_event(prepared_split.event_by_date)
+    prepared_split.mkt_by_date = normalizer.normalize_mkt(prepared_split.mkt_by_date)
+    prepared_split.company_profile_features = normalizer.normalize_profile(prepared_split.company_profile_features)
 
 
 def resolve_num_workers(num_workers: int | None) -> int:
@@ -879,6 +908,7 @@ def build_data_bundle(
     sampler_balance_horizon_index: int = 1,
     load_test_split: bool = True,
     merge_test_into_valid: bool = False,
+    pre_normalize_features: bool = False,
 ) -> DataBundle:
     train_split = build_or_load_split("train", train_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
     normalizer = FeatureNormalizer.fit(train_split)
@@ -892,6 +922,12 @@ def build_data_bundle(
     test_loader = None
     if load_test_split and not merge_test_into_valid:
         test_split = build_or_load_split("test", test_path, cache_dir, seq_length, rebuild_cache=rebuild_cache)
+
+    if pre_normalize_features:
+        _pre_normalize_split_features(train_split, normalizer)
+        _pre_normalize_split_features(valid_split, normalizer)
+        if test_split is not None:
+            _pre_normalize_split_features(test_split, normalizer)
 
     train_sampler = None
     if use_weighted_sampler:
@@ -915,6 +951,7 @@ def build_data_bundle(
             device_type=device_type,
             shuffle=True,
             sampler=train_sampler,
+            normalize_on_the_fly=not pre_normalize_features,
         ),
         valid_loader=build_loader(
             prepared_split=valid_split,
@@ -923,6 +960,7 @@ def build_data_bundle(
             num_workers=num_workers,
             device_type=device_type,
             shuffle=False,
+            normalize_on_the_fly=not pre_normalize_features,
         ),
         test_loader=(
             build_loader(
@@ -932,6 +970,7 @@ def build_data_bundle(
                 num_workers=num_workers,
                 device_type=device_type,
                 shuffle=False,
+                normalize_on_the_fly=not pre_normalize_features,
             )
             if test_split is not None
             else None
