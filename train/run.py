@@ -6,6 +6,7 @@ import csv
 import gc
 import json
 import random
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -120,6 +121,7 @@ class TrainConfig:
     amp_dtype: str
     pre_normalize_features: bool
     disable_tqdm: bool
+    resume_from: str | None
 
 
 @dataclass
@@ -154,10 +156,10 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--cache-dir", type=str, default="train/cache")
     parser.add_argument("--seq-length", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=8e-5)
+    parser.add_argument("--weight-decay", type=float, default=2e-3)
+    parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument("--seq-model-dim", type=int, default=64)
     parser.add_argument("--seq-output-dim", type=int, default=96)
     parser.add_argument("--seq-attn-heads", type=int, default=4)
@@ -167,7 +169,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--fusion-dim", type=int, default=256)
     parser.add_argument("--task-hidden-dim", type=int, default=192)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--early-stop-patience", type=int, default=5)
+    parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--rebuild-cache", action="store_true")
@@ -179,7 +181,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--use-amp", action="store_true", help="Enable CUDA autocast; float32 is the default.")
     parser.add_argument("--focal-gamma", type=float, default=0.25)
     parser.add_argument("--p-win-brier-weight", type=float, default=0.1)
-    parser.add_argument("--p-win-logit-l2-weight", type=float, default=5e-4)
+    parser.add_argument("--p-win-logit-l2-weight", type=float, default=6e-4)
     parser.add_argument("--no-decision-detach-aux", action="store_true")
     parser.add_argument("--disable-horizon-source-gate", action="store_true")
     parser.add_argument("--diagnostic-eval-batches", type=int, default=2)
@@ -187,13 +189,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--sampler-recency-power", type=float, default=1.5)
     parser.add_argument("--sampler-positive-balance-power", type=float, default=0.5)
     parser.add_argument("--sampler-balance-horizon-index", type=int, default=1)
-    parser.add_argument("--p-win-weight", type=float, default=1.2)
+    parser.add_argument("--p-win-weight", type=float, default=0.75)
     parser.add_argument("--ret-mu-weight", type=float, default=1.0)
     parser.add_argument("--ret-sigma-weight", type=float, default=0.05)
-    parser.add_argument("--risk-dd-weight", type=float, default=0.1)
-    parser.add_argument("--bigloss-weight", type=float, default=0.1)
+    parser.add_argument("--risk-dd-weight", type=float, default=0.2)
+    parser.add_argument("--bigloss-weight", type=float, default=0.3)
     parser.add_argument("--upside-weight", type=float, default=0.05)
-    parser.add_argument("--rank-pairwise-weight", type=float, default=1.5)
+    parser.add_argument("--rank-pairwise-weight", type=float, default=0.8)
     parser.add_argument("--rank-score-weight", type=float, default=0.0)
     parser.add_argument("--bigloss-margin-weight", type=float, default=0.0)
     parser.add_argument("--anti-conservative-weight", type=float, default=0.0)
@@ -212,7 +214,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--best-model-metric",
         type=str,
-        default="valid_business_score",
+        default="valid_topk_utility",
         choices=["valid_loss", "valid_p_win_acc", "valid_business_score", "valid_topk_utility"],
     )
     parser.add_argument("--max-train-batches", type=int, default=None)
@@ -230,11 +232,27 @@ def parse_args() -> TrainConfig:
         help="Normalize cached split tensors once at load time instead of per sample.",
     )
     parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume training from a .pt checkpoint. The starting epoch is parsed from names like epoch_11.pt.",
+    )
     args = parser.parse_args()
 
     device = resolve_device_name(args.device)
     batch_size = args.batch_size or recommended_batch_size(device)
-    output_dir = args.output_dir or f"train/artifacts/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if args.output_dir:
+        output_dir = args.output_dir
+    elif args.resume_from:
+        resume_candidate = Path(args.resume_from)
+        resume_path = resume_candidate if resume_candidate.is_absolute() else PROJECT_ROOT / resume_candidate
+        try:
+            output_dir = str(resume_path.parent.relative_to(PROJECT_ROOT))
+        except ValueError:
+            output_dir = str(resume_path.parent)
+    else:
+        output_dir = f"train/artifacts/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     return TrainConfig(
         train_path=args.train_path,
         valid_path=args.valid_path,
@@ -303,6 +321,7 @@ def parse_args() -> TrainConfig:
         amp_dtype=args.amp_dtype,
         pre_normalize_features=args.pre_normalize_features,
         disable_tqdm=args.disable_tqdm,
+        resume_from=args.resume_from,
     )
 
 
@@ -348,11 +367,53 @@ def save_history_csv(path: Path, history: list[dict[str, Any]]) -> None:
     if not history:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(history[0].keys())
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for record in history:
+        for key in record.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
     with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(history)
+
+
+def _coerce_history_value(value: Any) -> Any:
+    if value is None or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return stripped
+        try:
+            return float(stripped)
+        except ValueError:
+            return value
+    return value
+
+
+def load_history(output_dir: Path) -> list[dict[str, Any]]:
+    json_path = output_dir / "history.json"
+    if json_path.exists():
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        records = payload.get("epochs", payload if isinstance(payload, list) else [])
+        return [
+            {key: _coerce_history_value(value) for key, value in record.items()}
+            for record in records
+            if isinstance(record, dict)
+        ]
+
+    csv_path = output_dir / "history.csv"
+    if not csv_path.exists():
+        return []
+    with csv_path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        return [
+            {key: _coerce_history_value(value) for key, value in record.items()}
+            for record in reader
+        ]
 
 
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -457,6 +518,64 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
         return cosine
     warmup = LinearLR(optimizer, start_factor=0.35, end_factor=1.0, total_iters=warmup_epochs)
     return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+
+
+def resolve_project_path(path: str) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
+
+
+def parse_checkpoint_epoch(checkpoint_path: Path) -> int:
+    match = re.search(r"epoch[_-]?(\d+)", checkpoint_path.stem, flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"Cannot parse epoch from checkpoint filename: {checkpoint_path.name}")
+    return int(match.group(1))
+
+
+def metric_value_from_validation_summary(best_metric_name: str, validation_summary: dict[str, Any]) -> float | None:
+    metric_key_by_name = {
+        "valid_p_win_acc": "p_win_acc",
+        "valid_business_score": "business_score",
+        "valid_topk_utility": "topk_utility",
+        "valid_loss": "loss",
+    }
+    metric_key = metric_key_by_name.get(best_metric_name)
+    if metric_key is None or metric_key not in validation_summary:
+        return None
+    return float(validation_summary[metric_key])
+
+
+def initial_best_metric_value(best_metric_name: str) -> float:
+    if best_metric_name in {"valid_p_win_acc", "valid_business_score", "valid_topk_utility"}:
+        return float("-inf")
+    return float("inf")
+
+
+def best_topk_record_from_history(history: list[dict[str, Any]]) -> dict[str, Any] | None:
+    best_record: dict[str, Any] | None = None
+    best_value = float("-inf")
+    for record in history:
+        if "valid_topk_utility" not in record or "epoch" not in record:
+            continue
+        try:
+            topk_utility = float(record["valid_topk_utility"])
+        except (TypeError, ValueError):
+            continue
+        if topk_utility > best_value:
+            best_value = topk_utility
+            best_record = record
+    return best_record
+
+
+def find_epoch_checkpoint(output_dir: Path, epoch: int) -> Path | None:
+    candidates = [
+        output_dir / f"epoch_{epoch:02d}.pt",
+        output_dir / f"epoch_{epoch}.pt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def resolve_p_win_thresholds(
@@ -1653,7 +1772,7 @@ def main() -> None:
     set_seed(config.seed)
     configure_runtime(config.device)
 
-    output_dir = ensure_dir(PROJECT_ROOT / config.output_dir)
+    output_dir = ensure_dir(resolve_project_path(config.output_dir))
     cache_dir = ensure_dir(PROJECT_ROOT / config.cache_dir)
     save_json(output_dir / "config.json", asdict(config))
 
@@ -1681,21 +1800,121 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = build_scheduler(optimizer, config)
     scaler = torch.amp.GradScaler(device.type, enabled=bool(config.use_amp and device.type == "cuda"))
-    ema = ModelEMA(model, config.ema_decay) if 0.0 < config.ema_decay < 1.0 else None
 
-    history: list[dict[str, float]] = []
+    resume_checkpoint: dict[str, Any] | None = None
+    resume_epoch = 0
+    start_epoch = 1
+    if config.resume_from:
+        resume_path = resolve_project_path(config.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_epoch = parse_checkpoint_epoch(resume_path)
+        start_epoch = resume_epoch + 1
+        resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
+        model.load_state_dict(resume_checkpoint["model_state"])
+        if "optimizer_state" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        else:
+            print("Resume checkpoint has no optimizer_state; optimizer starts from current config.")
+        if "scheduler_state" in resume_checkpoint:
+            try:
+                scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
+            except Exception as exc:
+                print(f"Resume checkpoint scheduler_state was not loaded: {exc}")
+        else:
+            print("Resume checkpoint has no scheduler_state; scheduler starts from current config.")
+        if "scaler_state" in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint["scaler_state"])
+
+    ema = ModelEMA(model, config.ema_decay) if 0.0 < config.ema_decay < 1.0 else None
+    if resume_checkpoint is not None and ema is not None and "ema_state" in resume_checkpoint:
+        ema.shadow.load_state_dict(resume_checkpoint["ema_state"])
+
+    history: list[dict[str, Any]] = []
+    if resume_checkpoint is not None:
+        loaded_history = load_history(output_dir)
+        history = [
+            record
+            for record in loaded_history
+            if float(record.get("epoch", 0.0) or 0.0) < float(start_epoch)
+        ]
+        print(f"Loaded {len(history)} previous history records from {output_dir}.")
+
     best_valid_loss = float("inf")
     best_metric_name = str(config.best_model_metric)
-    if best_metric_name in {"valid_p_win_acc", "valid_business_score", "valid_topk_utility"}:
-        best_metric_value = float("-inf")
-    else:
-        best_metric_value = float("inf")
+    best_metric_value = initial_best_metric_value(best_metric_name)
     best_epoch = 0
     patience = 0
     checkpoint_path = output_dir / "best_model.pt"
 
+    if resume_checkpoint is not None:
+        validation_summary = resume_checkpoint.get("validation_summary") or {}
+        previous_best_record = best_topk_record_from_history(history)
+        if previous_best_record is not None:
+            best_epoch = int(float(previous_best_record["epoch"]))
+            best_metric_value = float(
+                previous_best_record.get(best_metric_name, previous_best_record["valid_topk_utility"])
+            )
+            best_valid_loss = float(previous_best_record.get("valid_loss", best_valid_loss))
+            best_epoch_checkpoint = find_epoch_checkpoint(output_dir, best_epoch)
+            if best_epoch_checkpoint is not None:
+                torch.save(torch.load(best_epoch_checkpoint, map_location="cpu", weights_only=True), checkpoint_path)
+            elif not checkpoint_path.exists():
+                print(f"Best epoch checkpoint epoch_{best_epoch}.pt not found; using resume checkpoint as fallback.")
+                torch.save(
+                    checkpoint_payload(
+                        ema.shadow if ema is not None else model,
+                        bundle,
+                        config,
+                        resume_epoch,
+                        best_valid_loss,
+                        best_metric_name,
+                        best_metric_value,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        ema=ema,
+                        validation_summary=validation_summary,
+                    ),
+                    checkpoint_path,
+                )
+        else:
+            resume_metric_value = metric_value_from_validation_summary(best_metric_name, validation_summary)
+            if resume_metric_value is not None:
+                best_metric_value = resume_metric_value
+            elif resume_checkpoint.get("best_metric_name") == best_metric_name and "best_metric_value" in resume_checkpoint:
+                best_metric_value = float(resume_checkpoint["best_metric_value"])
+            else:
+                print(f"Resume checkpoint has no current value for {best_metric_name}; next epoch can become best.")
+            best_valid_loss = float(validation_summary.get("loss", resume_checkpoint.get("best_valid_loss", best_valid_loss)))
+            best_epoch = resume_epoch
+            if not checkpoint_path.exists():
+                torch.save(
+                    checkpoint_payload(
+                        ema.shadow if ema is not None else model,
+                        bundle,
+                        config,
+                        resume_epoch,
+                        best_valid_loss,
+                        best_metric_name,
+                        best_metric_value,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        ema=ema,
+                        validation_summary=validation_summary,
+                    ),
+                    checkpoint_path,
+                )
+        print(
+            f"Resumed from {config.resume_from}: next epoch={start_epoch}, "
+            f"initial best_epoch={best_epoch}, {best_metric_name}={best_metric_value:.4f}"
+        )
+
     training_started_at = time.time()
-    for epoch in range(1, config.epochs + 1):
+    if start_epoch > config.epochs:
+        print(f"No training epochs to run: start_epoch={start_epoch} > epochs={config.epochs}.")
+    for epoch in range(start_epoch, config.epochs + 1):
         train_metrics = train_one_epoch(
             model,
             bundle.train_loader,
