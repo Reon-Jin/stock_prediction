@@ -153,6 +153,8 @@ export type MarketCandidate = {
   recommended_hold_days?: number;
   recommended_hold_label?: string;
   predicted_win_rate?: number;
+  raw_predicted_win_rate?: number;
+  win_rate_source?: string;
   signal_score?: number;
   rank_score_pred?: number;
   ret_mu_pred?: number;

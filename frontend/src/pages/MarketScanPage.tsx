@@ -18,7 +18,9 @@ function getHoldDays(item: MarketCandidate) {
 }
 
 function getWinRate(item: MarketCandidate) {
-  return item.predicted_win_rate ?? item.decision_result.decision.confidence;
+  const holdDays = getHoldDays(item);
+  const rawWinRate = item.prediction?.[`p_win_prob_${holdDays}`];
+  return rawWinRate ?? item.raw_predicted_win_rate ?? item.predicted_win_rate ?? item.decision_result.decision.confidence;
 }
 
 function getSignalScore(item: MarketCandidate) {

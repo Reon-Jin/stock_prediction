@@ -1324,16 +1324,14 @@ def rank_market_candidates_quick(
     holding_days: int | None = None,
 ) -> dict[str, Any]:
     """
-    快速推荐排序：只在 3/5/10 日窗口内选股，但会先按当前批次对各窗口做校准，
-    避免不同持有周期的原始胜率不在同一基准上时，结果被单一窗口长期垄断。
+    快速推荐排序：只使用模型输出的原始胜率，不再按批次或阈值做二次校准。
 
     流程：
     1. 接收所有已完成模型预测的候选记录。
-    2. 计算当前批次 3/5/10 日胜率均值，作为各窗口的批次基线。
-    3. 为每只股票选择相对各自窗口基线最强的持有时长。
-    4. 过滤掉胜率低于 50% 的股票，避免把低于抛硬币水平的结果当成推荐。
-    5. 按校准后的最佳分数排序。
-    6. 返回至多 top_n 只股票。
+    2. 为每只股票选择原始胜率最高的持有时长。
+    3. 过滤掉胜率低于 50% 的股票，避免把低于抛硬币水平的结果当成推荐。
+    4. 按原始胜率排序。
+    5. 返回至多 top_n 只股票。
 
     Args:
         records: 预测后的候选记录。
@@ -1357,10 +1355,6 @@ def rank_market_candidates_quick(
     if holding_days is not None and int(holding_days) not in allowed_horizons:
         raise ValueError("holding_days must be one of 3, 5, 10, 20, 40")
     horizons = (int(holding_days),) if holding_days is not None else (3, 5, 10)
-    horizon_baselines: dict[int, float] = {}
-    for horizon in horizons:
-        probabilities = [_normalize_probability(record.get(f"p_win_prob_{horizon}")) for record in records]
-        horizon_baselines[horizon] = sum(probabilities) / len(probabilities) if probabilities else 0.0
     
     enriched: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
@@ -1369,24 +1363,19 @@ def rank_market_candidates_quick(
         best_horizon = horizons[0]
         best_p_win = -1.0
         best_ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
-        best_adjusted_score = float("-inf")
 
         for horizon in horizons:
             p_win_key = f"p_win_prob_{horizon}"
             p_win = _normalize_probability(record.get(p_win_key))
             ret_mu = _safe_float(record.get(f"ret_mu_pred_{horizon}"))
-            adjusted_score = p_win - horizon_baselines[horizon]
-            candidate_score = (adjusted_score, p_win, ret_mu, -horizon)
-            if candidate_score > (best_adjusted_score, best_p_win, best_ret_mu, -best_horizon):
+            candidate_score = (p_win, ret_mu, -horizon)
+            if candidate_score > (best_p_win, best_ret_mu, -best_horizon):
                 best_horizon = horizon
                 best_p_win = p_win
                 best_ret_mu = ret_mu
-                best_adjusted_score = adjusted_score
 
         if best_p_win < 0:
             best_p_win = 0.0
-        if math.isinf(best_adjusted_score):
-            best_adjusted_score = 0.0
         
         symbol = str(record.get("symbol") or "")
         if not symbol:
@@ -1406,8 +1395,7 @@ def rank_market_candidates_quick(
             "avg_amount_5": avg_amount,
             "best_horizon": best_horizon,
             "best_p_win": best_p_win,
-            "adjusted_score": best_adjusted_score,
-            "sorting_score": (best_adjusted_score, best_p_win),
+            "sorting_score": (best_p_win, best_ret_mu, signal_score, rank_score),
             "best_ret_mu": best_ret_mu,
             "rank_score": rank_score,
             "signal_score": signal_score,
@@ -1418,7 +1406,6 @@ def rank_market_candidates_quick(
 
     eligible.sort(
         key=lambda x: (
-            x["adjusted_score"],
             x["best_p_win"],
             x["best_ret_mu"],
             x["signal_score"],
@@ -1467,6 +1454,8 @@ def rank_market_candidates_quick(
             "recommended_hold_days": best_horizon,
             "recommended_hold_label": f"{best_horizon}d",
             "predicted_win_rate": best_p_win,
+            "raw_predicted_win_rate": best_p_win,
+            "win_rate_source": "raw_model_output",
             "signal_score": item["signal_score"],
             "rank_score_pred": item["rank_score"],
             "ret_mu_pred": item["best_ret_mu"],

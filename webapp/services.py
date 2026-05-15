@@ -322,14 +322,6 @@ def _best_short_horizon(record: Mapping[str, Any]) -> tuple[int, float, float]:
     return best_horizon, max(0.0, float(best_p_win)), float(best_ret_mu)
 
 
-def _calibrate_probability_against_threshold(probability: float, threshold: float) -> float:
-    prob = min(max(float(probability), 0.0), 1.0)
-    th = min(max(float(threshold), 1e-6), 0.999999)
-    if prob >= th:
-        return min(1.0, 0.5 + 0.5 * ((prob - th) / max(1.0 - th, 1e-6)))
-    return max(0.0, 0.5 * (prob / th))
-
-
 def _packaged_column_mean(sequence: Any, columns: Any, target_column: str, window: int = 5) -> float:
     if target_column not in columns:
         return 0.0
@@ -1570,7 +1562,6 @@ def _simple_rank_candidates(
     top_n: int,
     risk_preference: str = "balanced",
     metadata: dict[str, Any] | None = None,
-    p_win_thresholds: dict[int, float] | None = None,
     holding_days: int | None = None,
 ) -> dict[str, Any]:
     if not records:
@@ -1584,7 +1575,6 @@ def _simple_rank_candidates(
         }
 
     horizons = tuple(int(item) for item in P_WIN_HORIZONS)
-    del p_win_thresholds
     selected_holding_days = _normalize_market_scan_holding_days(holding_days)
     buy_actions = {"STRONG_BUY", "BUY", "RECOMMEND_BUY"}
 
@@ -1707,6 +1697,8 @@ def _simple_rank_candidates(
                 "recommended_hold_days": best_horizon,
                 "recommended_hold_label": _horizon_label(best_horizon),
                 "predicted_win_rate": best_p_win,
+                "raw_predicted_win_rate": best_p_win,
+                "win_rate_source": "raw_model_output",
                 "signal_score": _safe_float(record.get("signal_score")),
                 "rank_score_pred": _safe_float(record.get("rank_score_pred")),
                 "ret_mu_pred": _safe_float(record.get(f"ret_mu_pred_{best_horizon}")),
@@ -1907,10 +1899,6 @@ def _build_market_scan_market_full(
         )
         for row in merged.to_dict(orient="records")
     ]
-    p_win_thresholds = {
-        horizon: float(bundle.thresholds[idx]) if idx < len(bundle.thresholds) else 0.5
-        for idx, horizon in enumerate(P_WIN_HORIZONS)
-    }
     ranking = _simple_rank_candidates(
         records,
         top_n=top_n,
@@ -1919,7 +1907,6 @@ def _build_market_scan_market_full(
             bundle,
             merged["feature_version"].iloc[0] if "feature_version" in merged.columns and not merged.empty else None,
         ),
-        p_win_thresholds=p_win_thresholds,
         holding_days=holding_days,
     )
     return {
@@ -2170,8 +2157,8 @@ def _rank_market_scan_quick_threshold(
                 "blocked_rules": [],
             },
                 "reasons": [
-                f"3/5/10日窗口中，{best_horizon}日的校准后胜率最高，为 {best_p_win * 100:.1f}%",
-                f"原始上涨概率 {_safe_float(record.get(f'quick_best_raw_p_win', record.get(f'p_win_prob_{best_horizon}'))) * 100:.1f}%，预测收益 {item['best_ret_mu'] * 100:.2f}%",
+                f"{best_horizon}日模型原始胜率最高，为 {best_p_win * 100:.1f}%",
+                f"预测收益 {item['best_ret_mu'] * 100:.2f}%",
             ],
         }
         candidates.append(
@@ -2187,6 +2174,8 @@ def _rank_market_scan_quick_threshold(
                 "recommended_hold_days": best_horizon,
                 "recommended_hold_label": f"{best_horizon}d",
                 "predicted_win_rate": best_p_win,
+                "raw_predicted_win_rate": best_p_win,
+                "win_rate_source": "raw_model_output",
                 "signal_score": _safe_float(record.get("signal_score")),
                 "rank_score_pred": _safe_float(record.get("rank_score_pred")),
                 "ret_mu_pred": item["best_ret_mu"],
@@ -2611,10 +2600,6 @@ def build_market_scan_v2(
             )
         ranking = rank_market_candidates_quick(records, top_n=top_n)
     else:
-        p_win_thresholds = {
-            horizon: float(bundle.thresholds[idx]) if idx < len(bundle.thresholds) else 0.5
-            for idx, horizon in enumerate(P_WIN_HORIZONS)
-        }
         ranking = _simple_rank_candidates(
             records,
             top_n=top_n,
@@ -2623,7 +2608,6 @@ def build_market_scan_v2(
                 bundle,
                 merged["feature_version"].iloc[0] if "feature_version" in merged.columns and not merged.empty else None,
             ),
-            p_win_thresholds=p_win_thresholds,
         )
     
     return {
