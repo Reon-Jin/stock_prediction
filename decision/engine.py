@@ -834,6 +834,118 @@ def evaluate_stock_decision(
     config: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    horizon_probs = {
+        horizon: _normalize_probability(record.get(f"p_win_prob_{horizon}"))
+        for horizon in HORIZONS
+    }
+    best_horizon = max(HORIZONS, key=lambda horizon: horizon_probs[horizon])
+    best_p_win = float(horizon_probs[best_horizon])
+    final_action = "BUY" if best_p_win > 0.50 else "AVOID"
+    action_meta = ACTION_META[final_action]
+    model_output = _build_model_output(record)
+    model_output.update({f"p_win_{horizon}": float(horizon_probs[horizon]) for horizon in HORIZONS})
+    scores = {
+        "U_final": best_p_win,
+        "U_3": float(horizon_probs[3]),
+        "U_5": float(horizon_probs[5]),
+        "U_10": float(horizon_probs[10]),
+        "U_20": float(horizon_probs[20]),
+        "U_40": float(horizon_probs[40]),
+        "S_final": best_p_win,
+        "S_3": float(horizon_probs[3]),
+        "S_5": float(horizon_probs[5]),
+        "S_10": float(horizon_probs[10]),
+        "S_20": float(horizon_probs[20]),
+        "S_40": float(horizon_probs[40]),
+        "consistency": 1.0,
+        "consistency_score": 1.0,
+        "conflict_state": "simple_p_win_rule",
+        "conflict_type": "none",
+        "conflict_penalty": 0.0,
+        "confidence_score": best_p_win,
+        "risk_score": 0.0,
+    }
+    risk_review = {
+        "passed": final_action == "BUY",
+        "original_action": final_action,
+        "final_action": final_action,
+        "downgraded": False,
+        "risk_level": "low",
+        "risk_score": 0.0,
+        "risk_flags": [],
+        "risk_warnings": [],
+        "blocked_rules": [],
+        "hard_blocks": [],
+        "hard_downgrades": [],
+        "soft_penalties": [],
+        "risk_components": {},
+    }
+    reasons = [
+        (
+            f"Simple rule: highest win probability is {best_horizon}d at {best_p_win:.2%}; "
+            f"{'buy because it is above 50%' if final_action == 'BUY' else 'avoid because no horizon is above 50%'}."
+        )
+    ]
+    return {
+        "symbol": str(record.get("symbol") or ""),
+        "symbol_name": str(record.get("name") or record.get("symbol_name") or ""),
+        "trade_date": str(record.get("trade_date") or ""),
+        "decision": {
+            "action": final_action,
+            "action_cn": action_meta["action_cn"],
+            "confidence": best_p_win,
+            "priority": action_meta["priority"],
+            "path": action_meta["path"],
+            "best_horizon": f"k={best_horizon}",
+            "suggested_hold_days": best_horizon,
+            "position_hint": "full_or_add_position" if final_action == "BUY" else "avoid_new_position",
+            "holding_stage": None,
+            "hold_progress": 0.0,
+        },
+        "utility": {
+            "U_3": float(horizon_probs[3]),
+            "U_5": float(horizon_probs[5]),
+            "U_10": float(horizon_probs[10]),
+            "U_20": float(horizon_probs[20]),
+            "U_40": float(horizon_probs[40]),
+            "U_final": best_p_win,
+            "consistency_score": 1.0,
+            "conflict_penalty": 0.0,
+            "confidence_score": best_p_win,
+        },
+        "horizon_analysis": {
+            "best_horizon": f"k={best_horizon}",
+            "best_horizon_score": best_p_win,
+            "horizon_ranking": [
+                {"horizon": horizon, "utility": float(prob)}
+                for horizon, prob in sorted(horizon_probs.items(), key=lambda item: item[1], reverse=True)
+            ],
+            "short_term_view": "positive" if max(horizon_probs[horizon] for horizon in (3, 5, 10)) > 0.50 else "negative",
+            "mid_term_view": "positive" if max(horizon_probs[horizon] for horizon in (20, 40)) > 0.50 else "negative",
+            "conflict_type": "none",
+        },
+        "scores": scores,
+        "model_output": model_output,
+        "market_regime": "neutral",
+        "market_regime_detail": {},
+        "risk_flags": [],
+        "risk_review": risk_review,
+        "reasons": reasons,
+        "metadata": {
+            "model_version": _resolve_model_version(record, metadata),
+            "feature_version": str(
+                (metadata or {}).get("feature_version")
+                or record.get("feature_version")
+                or record.get("data_version")
+                or "unknown_feature"
+            ),
+            "engine_version": ENGINE_VERSION,
+            "risk_preference": risk_preference,
+            "strategy_style": strategy_style,
+            "inference_ts": str((metadata or {}).get("inference_ts") or _now_iso()),
+        },
+    }
+
     cfg = _load_config(config)
     resolved_context = _resolve_context(
         context,
@@ -970,36 +1082,8 @@ def _is_candidate_eligible(
     decision_result: Mapping[str, Any],
     config: Mapping[str, Any],
 ) -> bool:
-    decision = decision_result["decision"]
-    scores = decision_result["scores"]
-    risk_review = decision_result["risk_review"]
-    list_days = int(_safe_float(record.get("list_days")))
-    pct_chg = _safe_float(record.get("pct_chg"))
-    max_bigloss = max(
-        _normalize_probability(decision_result["model_output"].get("bigloss_5")),
-        _normalize_probability(decision_result["model_output"].get("bigloss_10")),
-    )
-    if bool(record.get("is_st")) or bool(record.get("is_suspended")):
-        return False
-    if list_days and list_days < int(config["risk_thresholds"]["list_days_min"]):
-        return False
-    if pct_chg > 9.5:
-        return False
-    if scores["U_final"] < config["action_thresholds"][decision_result["market_regime"]]["buy"]:
-        return False
-    if decision["confidence"] < float(config["selection"]["min_confidence"]):
-        return False
-    if scores["consistency_score"] < float(config["selection"]["min_consistency"]):
-        return False
-    if risk_review["risk_level"] not in {"low", "medium"}:
-        return False
-    if max_bigloss > float(config["selection"]["max_bigloss_5_10"]):
-        return False
-    if risk_review["hard_blocks"]:
-        return False
-    if risk_review["final_action"] not in {"STRONG_BUY", "BUY", "RECOMMEND_BUY"}:
-        return False
-    return True
+    del record, config
+    return str(decision_result["decision"].get("action") or "") in {"STRONG_BUY", "BUY", "RECOMMEND_BUY"}
 
 
 def _upside_bonus(record: Mapping[str, Any]) -> float:
