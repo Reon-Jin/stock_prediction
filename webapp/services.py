@@ -1573,7 +1573,6 @@ def _simple_rank_candidates(
     p_win_thresholds: dict[int, float] | None = None,
     holding_days: int | None = None,
 ) -> dict[str, Any]:
-    del risk_preference
     if not records:
         return {
             "effective_trade_date": None,
@@ -1585,36 +1584,49 @@ def _simple_rank_candidates(
         }
 
     horizons = tuple(int(item) for item in P_WIN_HORIZONS)
-    thresholds = p_win_thresholds or {h: 0.5 for h in horizons}
+    del p_win_thresholds
     selected_holding_days = _normalize_market_scan_holding_days(holding_days)
+    buy_actions = {"STRONG_BUY", "BUY", "RECOMMEND_BUY"}
 
     def _horizon_label(days: int) -> str:
         return f"{int(days)}d"
 
     enriched: list[dict[str, Any]] = []
     for record in records:
+        actual_decision_result = evaluate_stock_decision(
+            record,
+            is_holding=False,
+            holding_days=0,
+            risk_preference=risk_preference,
+            metadata=metadata,
+        )
         best_horizon = selected_holding_days or max(
             horizons,
-            key=lambda horizon: _calibrate_probability_against_threshold(
+            key=lambda horizon: (
                 _safe_float(record.get(f"p_win_prob_{horizon}"), -1.0),
-                thresholds.get(horizon, 0.5),
+                _safe_float(record.get(f"ret_mu_pred_{horizon}")),
             ),
         )
         best_p_win = max(0.0, _safe_float(record.get(f"p_win_prob_{best_horizon}"), 0.0))
         signal_score = _safe_float(record.get("signal_score"))
         rank_score = _safe_float(record.get("rank_score_pred"))
         ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
+        action = str(actual_decision_result.get("decision", {}).get("action") or "")
+        action_priority = -int(actual_decision_result.get("decision", {}).get("priority") or 99)
         enriched.append(
             {
                 "record": record,
+                "actual_decision_result": actual_decision_result,
                 "best_horizon": int(best_horizon),
                 "best_p_win": float(best_p_win),
-                "ranking_score": (float(best_p_win), ret_mu, signal_score, rank_score),
+                "eligible": action in buy_actions and best_p_win >= 0.5,
+                "ranking_score": (action_priority, float(best_p_win), ret_mu, signal_score, rank_score),
             }
         )
 
-    enriched.sort(key=lambda item: item["ranking_score"], reverse=True)
-    selected = enriched[: int(top_n)]
+    ranked_pool = [item for item in enriched if item["eligible"]]
+    ranked_pool.sort(key=lambda item: item["ranking_score"], reverse=True)
+    selected = ranked_pool[: int(top_n)]
 
     candidates: list[dict[str, Any]] = []
     for rank_index, item in enumerate(selected, start=1):
@@ -1671,6 +1683,17 @@ def _simple_rank_candidates(
             ],
             "metadata": _json_ready(metadata or {}),
         }
+        decision_result = _json_ready(item["actual_decision_result"])
+        decision_result["model_output"] = model_output
+        decision_result.setdefault("scores", {})
+        decision_result["scores"]["R_score"] = best_p_win
+        decision_result.setdefault("decision", {})
+        decision_result["decision"]["confidence"] = best_p_win
+        decision_result["decision"]["suggested_hold_days"] = best_horizon
+        decision_result["decision"]["best_horizon"] = str(best_horizon)
+        reasons = list(decision_result.get("reasons", []))
+        reasons.insert(0, f"Predicted {_horizon_label(best_horizon)} win probability: {best_p_win * 100:.1f}%.")
+        decision_result["reasons"] = reasons
         candidates.append(
             {
                 "rank": rank_index,
@@ -1728,7 +1751,7 @@ def _simple_rank_candidates(
                     "avg_amount_5": _safe_float(record.get("avg_amount_5")),
                 },
                 "decision_result": decision_result,
-                "risk_flags": list(record.get("risk_flags", [])),
+                "risk_flags": list(decision_result.get("risk_flags", [])),
                 "reasons": decision_result["reasons"],
             }
         )
@@ -1737,9 +1760,9 @@ def _simple_rank_candidates(
         "effective_trade_date": str(records[0].get("trade_date") or ""),
         "holding_days": selected_holding_days,
         "top_n": int(top_n),
-        "pool_size": len(enriched),
+        "pool_size": len(ranked_pool),
         "selected_count": len(candidates),
-        "market_regime_counts": {"neutral": len(enriched)},
+        "market_regime_counts": {},
         "candidates": candidates,
     }
 
@@ -2076,7 +2099,7 @@ def _rank_market_scan_quick_threshold(
     selected_rows: list[dict[str, Any]] = []
     for record in records:
         best_horizon = int(record.get("quick_best_horizon") or 0)
-        best_p_win = _safe_float(record.get("quick_hit_win_rate"), -1.0)
+        best_p_win = _safe_float(record.get("quick_best_raw_p_win"), -1.0)
         best_ret_mu = _safe_float(record.get("quick_best_ret_mu"))
         if best_horizon <= 0 or best_p_win < 0:
             best_horizon = selected_holding_days
@@ -2289,15 +2312,6 @@ def _build_market_scan_quick_incremental(
     effective_trade_date: str | None = analysis_date
     qualified_records: list[dict[str, Any]] = []
     scanned_records = 0
-    threshold_map = {horizon: 0.5 for horizon in P_WIN_HORIZONS}
-    checkpoint_bundle: PredictionBundle | None = None
-    if checkpoint_path is not None and checkpoint_path.exists():
-        checkpoint_bundle = load_prediction_bundle(str(checkpoint_path.resolve()))
-        threshold_map = {
-            horizon: float(checkpoint_bundle.thresholds[idx]) if idx < len(checkpoint_bundle.thresholds) else 0.5
-            for idx, horizon in enumerate(P_WIN_HORIZONS)
-        }
-
     _ensure_quick_scan_shared_inputs(analysis_date)
 
     if progress:
@@ -2372,16 +2386,11 @@ def _build_market_scan_quick_incremental(
         for record in batch_records:
             best_horizon = selected_holding_days
             best_raw_p_win = _safe_float(record.get(f"p_win_prob_{best_horizon}"), 0.0)
-            best_hit_win_rate = _calibrate_probability_against_threshold(
-                best_raw_p_win,
-                threshold_map.get(best_horizon, 0.5),
-            )
             best_ret_mu = _safe_float(record.get(f"ret_mu_pred_{best_horizon}"))
             record["quick_best_horizon"] = best_horizon
-            record["quick_hit_win_rate"] = best_hit_win_rate
             record["quick_best_raw_p_win"] = best_raw_p_win
             record["quick_best_ret_mu"] = best_ret_mu
-            if best_hit_win_rate >= MARKET_SCAN_QUICK_MIN_WIN_RATE and best_ret_mu > MARKET_SCAN_QUICK_MIN_RET_MU:
+            if best_raw_p_win >= MARKET_SCAN_QUICK_MIN_WIN_RATE and best_ret_mu > MARKET_SCAN_QUICK_MIN_RET_MU:
                 qualified_records.append(record)
                 if progress:
                     progress(
@@ -2392,7 +2401,7 @@ def _build_market_scan_quick_incremental(
                             "message": (
                                 f"已命中 {len(qualified_records)}/{target_count}，"
                                 f"最新命中 {record.get('symbol')} "
-                                f"({best_hit_win_rate * 100:.1f}%, 收益 {best_ret_mu * 100:.2f}%)"
+                                f"({best_raw_p_win * 100:.1f}%, 收益 {best_ret_mu * 100:.2f}%)"
                             ),
                         }
                     )

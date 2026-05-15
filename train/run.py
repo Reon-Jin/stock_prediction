@@ -156,7 +156,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--cache-dir", type=str, default="train/cache")
     parser.add_argument("--seq-length", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=8e-5)
     parser.add_argument("--weight-decay", type=float, default=2e-3)
     parser.add_argument("--dropout", type=float, default=0.4)
