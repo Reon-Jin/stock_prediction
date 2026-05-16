@@ -89,6 +89,19 @@ export type SingleAnalysisResult = {
     checkpoint_path: string | null;
     feature_version: string;
   };
+  recommended_hold_days?: number;
+  recommended_hold_label?: string;
+  win_rate_horizon?: number;
+  predicted_win_rate?: number;
+  raw_predicted_win_rate?: number;
+  win_rate_source?: string;
+  win_rate?: {
+    horizon: number;
+    predicted_win_rate: number;
+    raw_predicted_win_rate: number;
+    win_rate_source: string;
+    horizons: Record<string, number>;
+  };
   stock: {
     symbol: string;
     name: string;

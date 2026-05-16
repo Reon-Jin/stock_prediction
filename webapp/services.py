@@ -322,6 +322,37 @@ def _best_short_horizon(record: Mapping[str, Any]) -> tuple[int, float, float]:
     return best_horizon, max(0.0, float(best_p_win)), float(best_ret_mu)
 
 
+def _coerce_prediction_horizon(value: Any) -> int | None:
+    try:
+        horizon = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return horizon if horizon in P_WIN_HORIZONS else None
+
+
+def _build_prediction_win_rate_payload(
+    record: Mapping[str, Any],
+    preferred_horizon: int | None = None,
+) -> dict[str, Any]:
+    horizon = _coerce_prediction_horizon(preferred_horizon)
+    if horizon is None:
+        horizon = max(
+            P_WIN_HORIZONS,
+            key=lambda item: _safe_float(record.get(f"p_win_prob_{item}"), -1.0),
+        )
+    predicted_win_rate = _safe_float(record.get(f"p_win_prob_{horizon}"))
+    return {
+        "horizon": int(horizon),
+        "predicted_win_rate": predicted_win_rate,
+        "raw_predicted_win_rate": predicted_win_rate,
+        "win_rate_source": "raw_model_output",
+        "horizons": {
+            str(item): _safe_float(record.get(f"p_win_prob_{item}"))
+            for item in P_WIN_HORIZONS
+        },
+    }
+
+
 def _packaged_column_mean(sequence: Any, columns: Any, target_column: str, window: int = 5) -> float:
     if target_column not in columns:
         return 0.0
@@ -1388,6 +1419,68 @@ def _ensure_exact_market_trade_date_inputs(
     )
     if len(raw_df) < min_context_rows or len(context_df) < min_context_rows or effective_trade_date != target_date:
         raise ValueError(f"无法为 {target_date} 构建市场样本")
+
+
+def _build_single_symbol_market_context_frames(
+    symbol: str,
+    analysis_date: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Build one stock's prediction rows from the full market feature universe.
+
+    Several model inputs are cross-sectional features: market breadth/turnover,
+    industry ranks, amount percentiles, and industry-relative returns. Building
+    features after filtering to a single symbol turns those values into
+    single-stock artifacts and produces predictions that disagree with full
+    market recommendation.
+    """
+    normalized_symbol = normalize_symbol(symbol)
+    _ensure_exact_trade_date_inputs(normalized_symbol, analysis_date)
+
+    market_total_candidates = int(get_active_security_count())
+    _ensure_full_market_daily_inputs(
+        analysis_date,
+        market_total_candidates=market_total_candidates,
+        progress=None,
+    )
+
+    raw_df, context_df, effective_trade_date = build_prediction_frame(
+        str(CONFIG_PATH),
+        target_date=analysis_date,
+        target_symbol=None,
+        target_symbols=None,
+        strict_target_date=True,
+    )
+    if effective_trade_date != analysis_date:
+        raise ValueError(
+            f"无法为 {analysis_date} 构建全市场上下文预测样本，实际获取到的是 {effective_trade_date}"
+        )
+    min_expected_samples = max(1, int(market_total_candidates * MARKET_SCAN_FULL_MIN_SAMPLE_RATIO))
+    if raw_df.empty or context_df.empty or len(raw_df) < min_expected_samples:
+        with FRESH_SAMPLE_LOCK:
+            _refresh_market_inputs_for_date(analysis_date, progress=None)
+        raw_df, context_df, effective_trade_date = build_prediction_frame(
+            str(CONFIG_PATH),
+            target_date=analysis_date,
+            target_symbol=None,
+            target_symbols=None,
+            strict_target_date=True,
+        )
+
+    if effective_trade_date != analysis_date:
+        raise ValueError(
+            f"无法为 {analysis_date} 构建全市场上下文预测样本，实际获取到的是 {effective_trade_date}"
+        )
+    if raw_df.empty or context_df.empty:
+        raise ValueError("当前数据库中没有可用于个股分析的全市场上下文样本。")
+
+    raw_symbol_df = raw_df[raw_df["symbol"].astype(str) == normalized_symbol].copy()
+    context_symbol_df = context_df[context_df["symbol"].astype(str) == normalized_symbol].copy()
+    if raw_symbol_df.empty or context_symbol_df.empty:
+        raise ValueError(f"{normalized_symbol} 在 {analysis_date} 的全市场上下文样本中不存在。")
+    return raw_symbol_df, context_symbol_df, str(effective_trade_date)
+
+
 def build_single_stock_analysis(
     symbol: str,
     target_date: str | None,
@@ -1414,13 +1507,9 @@ def build_single_stock_analysis(
                 )
     if progress:
         progress("extract_data")
-    _ensure_exact_trade_date_inputs(normalized_symbol, analysis_date)
-    raw_df, context_df, effective_trade_date = build_prediction_frame(
-        str(CONFIG_PATH),
-        target_date=analysis_date,
-        target_symbol=normalized_symbol,
-        strict_target_date=True,
-        include_st=True,
+    raw_df, context_df, effective_trade_date = _build_single_symbol_market_context_frames(
+        normalized_symbol,
+        analysis_date,
     )
     if effective_trade_date != analysis_date:
         raise ValueError(
@@ -1471,6 +1560,15 @@ def build_single_stock_analysis(
         risk_preference=risk_preference,
         metadata=_decision_metadata_from_bundle(bundle, row.get("feature_version")),
     )
+    decision_horizon = _coerce_prediction_horizon(
+        (decision_result.get("decision") or {}).get("suggested_hold_days")
+    )
+    comparison_horizon = _coerce_prediction_horizon(holding_days) if not is_holding else None
+    win_rate = _build_prediction_win_rate_payload(
+        row,
+        preferred_horizon=comparison_horizon or decision_horizon,
+    )
+    suggested_hold_days = int(decision_horizon or win_rate["horizon"])
     return {
         "analysis_date": analysis_date,
         "effective_trade_date": effective_trade_date,
@@ -1482,6 +1580,13 @@ def build_single_stock_analysis(
             "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
             "feature_version": str(row.get("feature_version") or "unknown_feature"),
         },
+        "recommended_hold_days": suggested_hold_days,
+        "recommended_hold_label": f"{suggested_hold_days}d",
+        "win_rate_horizon": int(win_rate["horizon"]),
+        "predicted_win_rate": float(win_rate["predicted_win_rate"]),
+        "raw_predicted_win_rate": float(win_rate["raw_predicted_win_rate"]),
+        "win_rate_source": str(win_rate["win_rate_source"]),
+        "win_rate": win_rate,
         "stock": {
             "symbol": row.get("symbol"),
             "name": row.get("name"),

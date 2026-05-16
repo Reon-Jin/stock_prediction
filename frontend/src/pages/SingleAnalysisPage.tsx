@@ -15,6 +15,8 @@ const MARKET_REGIME_LABELS: Record<string, string> = {
   bearish: "Bearish",
 };
 
+const formatPercent = (value: number | null | undefined, digits = 1) => `${((value ?? 0) * 100).toFixed(digits)}%`;
+
 export function SingleAnalysisPage() {
   const { setTopbarCenterContent } = useOutletContext<AppShellOutletContext>();
   const {
@@ -76,6 +78,14 @@ export function SingleAnalysisPage() {
   const marketRegimeLabel = decision
     ? MARKET_REGIME_LABELS[String(decision.market_regime).toLowerCase()] || decision.market_regime
     : "";
+  const suggestedHoldDays = decision?.decision.suggested_hold_days ?? result?.recommended_hold_days ?? 0;
+  const winRateHorizon = result?.win_rate?.horizon ?? result?.win_rate_horizon ?? suggestedHoldDays;
+  const predictedWinRate =
+    result?.win_rate?.predicted_win_rate ??
+    result?.predicted_win_rate ??
+    result?.prediction?.[`p_win_prob_${winRateHorizon}`] ??
+    0;
+  const decisionConfidence = decision?.decision.confidence ?? 0;
 
   return (
     <PageTransition>
@@ -119,7 +129,7 @@ export function SingleAnalysisPage() {
                 />
               </label>
               <label>
-                <span>持有天数</span>
+                <span>{form.is_holding ? "已持有天数" : "胜率周期（可选）"}</span>
                 <input
                   type="number"
                   min={0}
@@ -194,13 +204,26 @@ export function SingleAnalysisPage() {
                     <p className="eyebrow">Action</p>
                     <h3>{decision.decision.action_cn}</h3>
                     <p className="small-muted">
-                      置信度 {(decision.decision.confidence * 100).toFixed(1)}% | 建议持有 {decision.decision.suggested_hold_days} 天
+                      预测胜率 {formatPercent(predictedWinRate)}（{winRateHorizon}天） | 决策置信度 {formatPercent(decisionConfidence)} | 建议持有{" "}
+                      {suggestedHoldDays} 天
                     </p>
                   </div>
 
                   <div className="hero-market-overview">
-                    <h4>行情概览</h4>
+                    <h4>模型与行情</h4>
                     <div className="hero-market-grid">
+                      <div>
+                        <span>预测胜率</span>
+                        <strong>{formatPercent(predictedWinRate)}</strong>
+                      </div>
+                      <div>
+                        <span>胜率周期</span>
+                        <strong>{winRateHorizon}天</strong>
+                      </div>
+                      <div>
+                        <span>决策置信度</span>
+                        <strong>{formatPercent(decisionConfidence)}</strong>
+                      </div>
                       <div>
                         <span>收盘价</span>
                         <strong>{(result.market_snapshot.close || 0).toFixed(2)}</strong>
