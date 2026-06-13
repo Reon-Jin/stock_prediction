@@ -6,7 +6,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -591,6 +591,89 @@ class DataBundle:
     train_loader: DataLoader
     valid_loader: DataLoader
     test_loader: DataLoader | None
+
+
+@dataclass
+class WalkForwardFold:
+    fold_index: int
+    train_split: PreparedSplit
+    valid_split: PreparedSplit
+    train_date_range: tuple[int, int]
+    valid_date_range: tuple[int, int]
+
+
+def subset_prepared_split(prepared: PreparedSplit, sample_positions: torch.Tensor, split_name: str) -> PreparedSplit:
+    """Return a view-like PreparedSplit with only selected sample positions."""
+    positions = sample_positions.detach().cpu().long().reshape(-1)
+    if positions.numel() == 0:
+        sample_rows = torch.empty(0, dtype=prepared.sample_row_indices.dtype)
+        sample_starts = torch.empty(0, dtype=prepared.sample_start_indices.dtype)
+    else:
+        valid_mask = (positions >= 0) & (positions < int(prepared.sample_count))
+        positions = positions[valid_mask]
+        sample_rows = prepared.sample_row_indices[positions].clone()
+        sample_starts = prepared.sample_start_indices[positions].clone()
+    return replace(
+        prepared,
+        split_name=split_name,
+        sample_row_indices=sample_rows,
+        sample_start_indices=sample_starts,
+        sample_count=int(sample_rows.numel()),
+    )
+
+
+def build_walk_forward_folds(
+    prepared: PreparedSplit,
+    fold_count: int,
+    min_train_ratio: float = 0.5,
+) -> list[WalkForwardFold]:
+    """Build expanding-window folds from an existing PreparedSplit without materializing new files."""
+    fold_count = max(0, int(fold_count))
+    if fold_count <= 1 or prepared.sample_count <= 1:
+        return []
+
+    sample_positions = torch.arange(int(prepared.sample_count), dtype=torch.long)
+    sample_rows = prepared.sample_row_indices.long()
+    sample_dates = prepared.row_to_date_idx[sample_rows].long()
+    unique_dates = torch.unique(sample_dates, sorted=True)
+    if unique_dates.numel() < 3:
+        return []
+
+    min_train_ratio = min(max(float(min_train_ratio), 0.1), 0.9)
+    min_train_dates = max(1, int(unique_dates.numel() * min_train_ratio))
+    remaining_dates = int(unique_dates.numel()) - min_train_dates
+    if remaining_dates <= 0:
+        return []
+    fold_width = max(1, int(np.ceil(remaining_dates / float(fold_count))))
+
+    folds: list[WalkForwardFold] = []
+    for fold_index in range(fold_count):
+        train_end_pos = min_train_dates + fold_index * fold_width
+        valid_end_pos = min(int(unique_dates.numel()), train_end_pos + fold_width)
+        if train_end_pos <= 0 or valid_end_pos <= train_end_pos:
+            continue
+
+        train_dates = unique_dates[:train_end_pos]
+        valid_dates = unique_dates[train_end_pos:valid_end_pos]
+        train_mask = torch.isin(sample_dates, train_dates)
+        valid_mask = torch.isin(sample_dates, valid_dates)
+        if not bool(train_mask.any().item()) or not bool(valid_mask.any().item()):
+            continue
+
+        train_positions = sample_positions[train_mask]
+        valid_positions = sample_positions[valid_mask]
+        train_split = subset_prepared_split(prepared, train_positions, f"{prepared.split_name}_wf{fold_index + 1}_train")
+        valid_split = subset_prepared_split(prepared, valid_positions, f"{prepared.split_name}_wf{fold_index + 1}_valid")
+        folds.append(
+            WalkForwardFold(
+                fold_index=fold_index + 1,
+                train_split=train_split,
+                valid_split=valid_split,
+                train_date_range=(int(train_dates[0].item()), int(train_dates[-1].item())),
+                valid_date_range=(int(valid_dates[0].item()), int(valid_dates[-1].item())),
+            )
+        )
+    return folds
 
 
 def prepare_split(

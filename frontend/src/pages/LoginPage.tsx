@@ -39,7 +39,7 @@ export function LoginPage() {
       <div className="auth-page">
         <section className="auth-hero">
           <p className="eyebrow">股票洞察</p>
-          <h1>更快地看懂个股机会。</h1>
+          <h1>股票分析助手</h1>
           <p className="hero-copy">登录后即可使用个股分析、股票推荐和后续扩展功能。</p>
         </section>
 

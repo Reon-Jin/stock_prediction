@@ -62,7 +62,7 @@ button { border: 0; cursor: pointer; }
 }
 
 .auth-hero {
-  padding: 56px;
+  padding: 50px;
   display: flex;
   flex-direction: column;
   justify-content: center;

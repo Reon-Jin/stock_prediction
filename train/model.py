@@ -210,6 +210,7 @@ class TemporalFinancialEncoder(nn.Module):
 class CrossGate(nn.Module):
     def __init__(self, dim: int, context_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
+        self.norm = nn.LayerNorm(dim)
         self.gate = nn.Sequential(
             nn.Linear(dim + context_dim, dim),
             nn.GELU(),
@@ -218,11 +219,15 @@ class CrossGate(nn.Module):
             nn.Sigmoid(),
         )
         self.context_proj = nn.Linear(context_dim, dim)
+        self.scale_proj = nn.Sequential(nn.Linear(context_dim, dim), nn.Tanh())
+        self.additive_scale = nn.Parameter(torch.tensor(0.1))
+        self.multiplicative_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         gate = self.gate(torch.cat([x, context], dim=-1))
         context_term = self.context_proj(context)
-        return x + gate * context_term
+        scale_term = self.scale_proj(context) * self.norm(x)
+        return x + self.additive_scale * gate * context_term + self.multiplicative_scale * scale_term
 
 
 class HorizonProjector(nn.Module):
@@ -308,6 +313,14 @@ class LongTermHorizonExpert(nn.Module):
             nn.Linear(expert_dim, expert_dim),
             nn.Sigmoid(),
         )
+        self.risk_residual = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.LayerNorm(expert_dim),
+            nn.GELU(),
+            nn.Dropout(stable_dropout),
+            nn.Linear(expert_dim, expert_dim),
+        )
+        self.risk_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.blocks = nn.ModuleList(
             [GatedResidualBlock(expert_dim, expert_dim * 2, dropout=stable_dropout) for _ in range(3)]
         )
@@ -316,14 +329,16 @@ class LongTermHorizonExpert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         trend = self.trend_path(x)
         cycle = self.cycle_path(x)
-        hidden = trend + self.risk_gate(x) * cycle * torch.tanh(self.horizon_scale)
+        risk_gate = self.risk_gate(x)
+        hidden = trend + risk_gate * cycle * torch.tanh(self.horizon_scale)
+        hidden = hidden + self.risk_residual_scale * risk_gate * self.risk_residual(x)
         for block in self.blocks:
             hidden = block(hidden)
         return self.output(hidden)
 
 
 class HorizonSourceGate(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, context_dim: int) -> None:
         super().__init__()
         self.horizons = HORIZONS
         self.source_names = ("seq", "event", "market", "tab", "company", "neighbor")
@@ -339,9 +354,23 @@ class HorizonSourceGate(nn.Module):
         )
         self.register_buffer("source_prior", priors)
         self.source_logits = nn.Parameter(torch.log(priors.clamp_min(1e-4)))
+        self.context_delta = nn.Sequential(
+            nn.LayerNorm(context_dim),
+            nn.Linear(context_dim, len(self.horizons) * len(self.source_names)),
+        )
+        nn.init.zeros_(self.context_delta[-1].weight)
+        nn.init.zeros_(self.context_delta[-1].bias)
 
-    def weights(self) -> torch.Tensor:
-        return torch.softmax(self.source_logits, dim=-1)
+    def weights(self, context: torch.Tensor | None = None) -> torch.Tensor:
+        if context is None:
+            return torch.softmax(self.source_logits, dim=-1)
+        delta = self.context_delta(context).view(
+            context.size(0),
+            len(self.horizons),
+            len(self.source_names),
+        )
+        logits = self.source_logits.unsqueeze(0) + 0.1 * delta
+        return torch.softmax(logits, dim=-1)
 
 
 class HorizonExpertBank(nn.Module):
@@ -349,13 +378,14 @@ class HorizonExpertBank(nn.Module):
         self,
         input_dim: int,
         expert_dim: int,
+        context_dim: int,
         dropout: float = 0.1,
         source_gate_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.horizons = HORIZONS
         self.source_gate_enabled = bool(source_gate_enabled)
-        self.source_gate = HorizonSourceGate() if self.source_gate_enabled else None
+        self.source_gate = HorizonSourceGate(context_dim=context_dim) if self.source_gate_enabled else None
         self.experts = nn.ModuleDict(
             {
                 str(horizon): (
@@ -391,12 +421,13 @@ class HorizonExpertBank(nn.Module):
             "company": company_repr,
             "neighbor": neighbor_repr,
         }
-        weights = self.source_gate.weights().to(device=fused.device, dtype=fused.dtype)
+        weights_by_sample = self.source_gate.weights(context_repr).to(device=fused.device, dtype=fused.dtype)
+        weights = weights_by_sample.mean(dim=0)
         scale = float(len(self.source_gate.source_names))
         expert_reprs: dict[int, torch.Tensor] = {}
         for horizon_idx, horizon in enumerate(self.horizons):
             gated_sources = [
-                sources[source_name] * weights[horizon_idx, source_idx] * scale
+                sources[source_name] * weights_by_sample[:, horizon_idx, source_idx : source_idx + 1] * scale
                 for source_idx, source_name in enumerate(self.source_gate.source_names)
             ]
             expert_input = torch.cat([fused, *gated_sources], dim=-1)
@@ -515,6 +546,14 @@ class EventEncoderWithGate(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, depth: int = 2, dropout: float = 0.1) -> None:
         super().__init__()
         self.encoder = DeepMLPEncoder(input_dim, hidden_dim, output_dim, depth=depth, dropout=dropout)
+        self.adapter_norm = nn.LayerNorm(output_dim)
+        self.adapter = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.adapter_scale = nn.Parameter(torch.tensor(0.05))
         self.confidence_gate = nn.Sequential(
             nn.Linear(input_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
@@ -523,10 +562,29 @@ class EventEncoderWithGate(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid(),
         )
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+        self.direction_head = nn.Sequential(
+            nn.LayerNorm(output_dim),
+            nn.Linear(output_dim, output_dim),
+            nn.Tanh(),
+        )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         strength = self.confidence_gate(x)
-        return self.encoder(x) * strength, strength
+        uncertainty = self.uncertainty_head(x)
+        encoded = self.encoder(x)
+        adapted = encoded + self.adapter_scale * self.adapter(self.adapter_norm(encoded))
+        effective_strength = strength * (1.0 - 0.5 * uncertainty)
+        event_repr = adapted * effective_strength
+        event_direction = self.direction_head(event_repr)
+        return event_repr, strength, event_direction, uncertainty
 
 
 class NeighborAttentionEncoder(nn.Module):
@@ -594,9 +652,17 @@ class ProfessionalFinancialModel(nn.Module):
         horizon_source_gate: bool = False,
         decision_aux_features: tuple[str, ...] | list[str] | None = None,
         decision_detach_aux: bool = True,
+        ablate_event: bool = False,
+        ablate_market: bool = False,
+        ablate_company: bool = False,
+        ablate_neighbor: bool = False,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
+        self.ablate_event = bool(ablate_event)
+        self.ablate_market = bool(ablate_market)
+        self.ablate_company = bool(ablate_company)
+        self.ablate_neighbor = bool(ablate_neighbor)
         self.temporal_encoder = TemporalFinancialEncoder(
             input_dim=input_dims["f_seq"],
             seq_length=input_dims["seq_length"],
@@ -663,6 +729,7 @@ class ProfessionalFinancialModel(nn.Module):
         self.horizon_experts = HorizonExpertBank(
             input_dim=horizon_expert_input_dim,
             expert_dim=horizon_expert_dim,
+            context_dim=context_dim,
             dropout=dropout,
             source_gate_enabled=horizon_source_gate,
         )
@@ -772,8 +839,15 @@ class ProfessionalFinancialModel(nn.Module):
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         seq_repr = self.temporal_encoder(batch["X_seq"].float())
         tab_repr = self.tab_encoder(batch["X_tab"].float())
-        event_repr, event_strength = self.event_encoder(batch["X_event"].float())
+        event_repr, event_strength, event_direction, event_uncertainty = self.event_encoder(batch["X_event"].float())
+        if self.ablate_event:
+            event_repr = torch.zeros_like(event_repr)
+            event_strength = torch.zeros_like(event_strength)
+            event_direction = torch.zeros_like(event_direction)
+            event_uncertainty = torch.ones_like(event_uncertainty)
         mkt_repr = self.mkt_encoder(batch["X_mkt"].float())
+        if self.ablate_market:
+            mkt_repr = torch.zeros_like(mkt_repr)
         context_repr = self.context_fusion(torch.cat([event_repr, mkt_repr], dim=-1))
 
         company_repr = self.company_encoder(
@@ -782,11 +856,15 @@ class ProfessionalFinancialModel(nn.Module):
             board_id=batch["X_company_ids"]["board_id"],
             company_profile_features=batch["X_company_profile"].float(),
         )
+        if self.ablate_company:
+            company_repr = torch.zeros_like(company_repr)
         neighbor_repr = self.neighbor_encoder(
             company_repr,
             batch["neighbors"]["neighbor_symbol_ids"],
             batch["neighbors"]["neighbor_scores"].float(),
         )
+        if self.ablate_neighbor:
+            neighbor_repr = torch.zeros_like(neighbor_repr)
 
         seq_repr = self.seq_gate(seq_repr, context_repr)
         tab_repr = self.tab_gate(tab_repr, context_repr)
@@ -810,6 +888,8 @@ class ProfessionalFinancialModel(nn.Module):
         outputs = {head_name: head(fused) for head_name, head in self.shared_heads.items()}
         outputs.update({head_name: head(expert_reprs) for head_name, head in self.horizon_heads.items()})
         outputs["event_strength"] = event_strength
+        outputs["event_direction"] = event_direction
+        outputs["event_uncertainty"] = event_uncertainty
         outputs["expert_source_weights"] = expert_source_weights
         outputs["expert_source_prior"] = self.horizon_experts.source_prior().to(device=fused.device, dtype=fused.dtype)
         ret_sigma_raw = (

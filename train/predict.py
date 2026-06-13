@@ -170,7 +170,7 @@ class RawInferenceDataset(Dataset[dict[str, Any]]):
 
 @dataclass
 class PredictConfig:
-    checkpoint_path: str
+    checkpoint_paths: list[str]
     input_path: str
     output_path: str | None
     batch_size: int
@@ -181,7 +181,7 @@ class PredictConfig:
 
 def parse_args() -> PredictConfig:
     parser = argparse.ArgumentParser(description="Run inference with a trained tiny multi-input stock model.")
-    parser.add_argument("--checkpoint-path", type=str, required=True)
+    parser.add_argument("--checkpoint-path", type=str, action="append", required=True)
     parser.add_argument("--input-path", type=str, required=True, help="today_infer parquet or raw parquet path")
     parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -193,7 +193,7 @@ def parse_args() -> PredictConfig:
     device = resolve_device_name(args.device)
     batch_size = args.batch_size or (2048 if device == "cuda" else 512)
     return PredictConfig(
-        checkpoint_path=args.checkpoint_path,
+        checkpoint_paths=args.checkpoint_path,
         input_path=args.input_path,
         output_path=args.output_path,
         batch_size=batch_size,
@@ -237,8 +237,34 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[TinyMultiIn
         "ret_sigma_head.",
         "upside_head.",
         "decision_score_head.",
+        "event_encoder.adapter_norm.",
+        "event_encoder.adapter.",
+        "event_encoder.adapter_scale",
         "event_encoder.confidence_gate.",
+        "event_encoder.uncertainty_head.",
+        "event_encoder.direction_head.",
         "neighbor_encoder.",
+        "seq_gate.norm.",
+        "seq_gate.scale_proj.",
+        "seq_gate.additive_scale",
+        "seq_gate.multiplicative_scale",
+        "tab_gate.norm.",
+        "tab_gate.scale_proj.",
+        "tab_gate.additive_scale",
+        "tab_gate.multiplicative_scale",
+        "company_gate.norm.",
+        "company_gate.scale_proj.",
+        "company_gate.additive_scale",
+        "company_gate.multiplicative_scale",
+        "neighbor_gate.norm.",
+        "neighbor_gate.scale_proj.",
+        "neighbor_gate.additive_scale",
+        "neighbor_gate.multiplicative_scale",
+        "horizon_experts.source_gate.context_delta.",
+        "horizon_experts.experts.20.risk_residual.",
+        "horizon_experts.experts.20.risk_residual_scale",
+        "horizon_experts.experts.40.risk_residual.",
+        "horizon_experts.experts.40.risk_residual_scale",
     )
     allowed_unexpected_prefixes = (
         "p_win_regime_scale",
@@ -285,6 +311,37 @@ def resolve_p_win_thresholds(checkpoint: dict[str, Any]) -> np.ndarray:
     return values[: len(P_WIN_HORIZONS)]
 
 
+def resolve_ensemble_p_win_thresholds(checkpoints: list[dict[str, Any]]) -> np.ndarray:
+    if not checkpoints:
+        return np.full(len(P_WIN_HORIZONS), 0.5, dtype=np.float32)
+    thresholds = [resolve_p_win_thresholds(checkpoint) for checkpoint in checkpoints]
+    return np.mean(np.stack(thresholds, axis=0), axis=0).astype(np.float32, copy=False)
+
+
+def _average_model_outputs(outputs_by_model: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not outputs_by_model:
+        raise ValueError("At least one model output is required for prediction.")
+    if len(outputs_by_model) == 1:
+        return outputs_by_model[0]
+
+    common_keys = set(outputs_by_model[0].keys())
+    for outputs in outputs_by_model[1:]:
+        common_keys.intersection_update(outputs.keys())
+
+    averaged: dict[str, torch.Tensor] = {}
+    for key in common_keys:
+        values = [outputs[key] for outputs in outputs_by_model if isinstance(outputs.get(key), torch.Tensor)]
+        if len(values) != len(outputs_by_model):
+            continue
+        if not all(value.shape == values[0].shape for value in values):
+            continue
+        if values[0].is_floating_point():
+            averaged[key] = torch.stack(values, dim=0).mean(dim=0)
+    if "bigloss" in averaged:
+        averaged["bigloss_prob"] = torch.sigmoid(averaged["bigloss"])
+    return averaged
+
+
 def build_dataset(
     input_path: Path,
     normalizer: FeatureNormalizer,
@@ -313,7 +370,7 @@ def default_output_path(input_path: Path) -> Path:
 
 @torch.no_grad()
 def run_prediction(
-    model: TinyMultiInputModel,
+    model: TinyMultiInputModel | list[TinyMultiInputModel],
     loader: DataLoader,
     device: torch.device,
     p_win_thresholds: np.ndarray | None = None,
@@ -321,6 +378,7 @@ def run_prediction(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     autocast_enabled = device.type == "cuda"
+    models = model if isinstance(model, list) else [model]
     thresholds = (
         np.asarray(p_win_thresholds, dtype=np.float32).reshape(-1)
         if p_win_thresholds is not None
@@ -332,7 +390,7 @@ def run_prediction(
         meta = batch["meta"]
         batch = move_batch_to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=autocast_enabled):
-            outputs = model(batch)
+            outputs = _average_model_outputs([single_model(batch) for single_model in models])
         p_win_prob = torch.sigmoid(outputs["p_win"]).detach().cpu().numpy()
         ret_mu_pred = outputs["ret_mu"].detach().cpu().numpy()
         risk_dd_pred = outputs["risk_dd"].detach().cpu().numpy()
@@ -399,7 +457,10 @@ def run_prediction(
 
 def main() -> None:
     config = parse_args()
-    checkpoint_path = PROJECT_ROOT / config.checkpoint_path if not Path(config.checkpoint_path).is_absolute() else Path(config.checkpoint_path)
+    checkpoint_paths = [
+        PROJECT_ROOT / path if not Path(path).is_absolute() else Path(path)
+        for path in config.checkpoint_paths
+    ]
     input_path = PROJECT_ROOT / config.input_path if not Path(config.input_path).is_absolute() else Path(config.input_path)
     if config.output_path:
         output_candidate = Path(config.output_path)
@@ -408,12 +469,15 @@ def main() -> None:
         output_path = default_output_path(input_path)
 
     device = torch.device(config.device)
-    model, normalizer, checkpoint = load_model(checkpoint_path, device)
-    p_win_thresholds = resolve_p_win_thresholds(checkpoint)
+    loaded = [load_model(checkpoint_path, device) for checkpoint_path in checkpoint_paths]
+    models = [item[0] for item in loaded]
+    normalizer = loaded[0][1]
+    checkpoints = [item[2] for item in loaded]
+    p_win_thresholds = resolve_ensemble_p_win_thresholds(checkpoints)
     dataset = build_dataset(
         input_path,
         normalizer,
-        seq_length=int(checkpoint["input_dims"]["seq_length"]),
+        seq_length=int(checkpoints[0]["input_dims"]["seq_length"]),
         limit=config.limit,
         all_dates=config.all_dates,
     )
@@ -426,13 +490,28 @@ def main() -> None:
         collate_fn=collate_inference_batch,
     )
 
-    predictions = run_prediction(model, loader, device, p_win_thresholds=p_win_thresholds)
+    predictions = run_prediction(models, loader, device, p_win_thresholds=p_win_thresholds)
+    predictions.attrs["checkpoint_paths"] = [str(path) for path in checkpoint_paths]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     predictions.to_parquet(output_path, index=False)
     csv_path = output_path.with_suffix(".csv")
     predictions.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    metadata_path = output_path.with_suffix(".metadata.json")
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "checkpoint_paths": [str(path) for path in checkpoint_paths],
+                "checkpoint_count": len(checkpoint_paths),
+                "p_win_thresholds": [float(value) for value in p_win_thresholds.tolist()],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"Predictions saved to: {output_path}")
     print(f"CSV copy saved to: {csv_path}")
+    print(f"Metadata saved to: {metadata_path}")
     print(f"Predicted rows: {len(predictions)}")
     if not predictions.empty:
         print(predictions.head(10).to_string(index=False))
